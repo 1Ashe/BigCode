@@ -8,7 +8,6 @@ from pathlib import Path
 
 from bigcode.config import load_runtime_config
 from bigcode.diagnostics import build_doctor_report, render_doctor_report
-from bigcode.hooks.command import CommandRegistry, command_hooks_from_settings
 from bigcode.skills.loader import load_skills
 
 
@@ -106,46 +105,7 @@ class Phase3EcosystemTests(unittest.TestCase):
             self.assertEqual(overridden.get("repo-map").description, "Override skill")
             self.assertEqual(overridden.get("repo-map").source, "skill")
 
-    def test_command_registry_validates_without_throwing(self) -> None:
-        settings = {
-            "PreToolUse": [
-                {
-                    "matcher": "Bash",
-                    "hooks": [
-                        {"type": "command", "command": "python check.py", "timeout": 5},
-                        {"type": "command", "timeout": 5},
-                        {"type": "command", "command": "python disabled.py", "enabled": False},
-                    ],
-                }
-            ],
-            "NotAnEvent": [{"hooks": [{"type": "command", "command": "python bad.py"}]}],
-        }
-        registry = CommandRegistry.from_settings(settings)
-        self.assertEqual(registry.status_counts(), {"enabled": 1, "disabled": 1, "failed": 2})
-        handlers = registry.enabled_handlers()
-        self.assertEqual(len(handlers), 1)
-        self.assertEqual(handlers[0].spec.command, "python check.py")
-        self.assertEqual(command_hooks_from_settings(settings)[0].spec.matcher, "Bash")
-
-    def test_plugin_commands_are_reported_as_unsupported(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            plugin = root / "plugins" / "demo-plugin"
-            (plugin / ".codex-plugin").mkdir(parents=True)
-            (plugin / ".codex-plugin" / "plugin.json").write_text(
-                """
-                {
-                  "name": "demo-plugin",
-                  "commands": [{"event": "Stop", "command": "python plugin.py"}]
-                }
-                """,
-                encoding="utf-8",
-            )
-            registry = CommandRegistry.from_settings({}, plugin_roots=[root / "plugins"])
-            self.assertEqual(registry.status_counts(), {"enabled": 0, "disabled": 1, "failed": 0})
-            self.assertIn("not supported", registry.registrations[0].reason)
-
-    def test_doctor_reports_skill_and_command_status(self) -> None:
+    def test_doctor_reports_skill_status(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _write_model_config(root)
@@ -160,21 +120,7 @@ class Phase3EcosystemTests(unittest.TestCase):
                   "skills": [
                     {"name": "plugin-skill", "path": "skill/SKILL.md"},
                     {"name": "off-skill", "path": "skill/SKILL.md", "enabled": false}
-                  ],
-                  "commands": [{"event": "Stop", "command": "python plugin.py"}]
-                }
-                """,
-                encoding="utf-8",
-            )
-            cfg = root / ".bigcode"
-            (cfg / "settings.json").write_text(
-                """
-                {
-                  "hooks": {
-                    "PreToolUse": [
-                      {"matcher": "Bash", "hooks": [{"type": "command", "command": "python check.py"}]}
-                    ]
-                  }
+                  ]
                 }
                 """,
                 encoding="utf-8",
@@ -187,9 +133,7 @@ class Phase3EcosystemTests(unittest.TestCase):
             self.assertIn("skills:", rendered)
             self.assertIn("plugin-skill", rendered)
             self.assertIn("off-skill", rendered)
-            self.assertIn("commands:", rendered)
-            self.assertIn("python check.py", rendered)
-            self.assertIn("plugin command registration is not supported", rendered)
+            self.assertNotIn("commands:", rendered)
 
 
 if __name__ == "__main__":

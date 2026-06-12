@@ -13,7 +13,6 @@ from typing import Any, Literal
 import httpx
 
 from bigcode.config.models import ResolvedModel, RuntimeConfig
-from bigcode.hooks.command import CommandRegistry
 from bigcode.mcp import McpClientManager
 from bigcode.skills import SkillRegistry, load_skills
 from bigcode.tools import ToolRegistry, build_default_registry
@@ -95,7 +94,6 @@ async def build_doctor_report(
     active_model = _check_models(config, active_model_ref, report, env)
     _check_tools(report, registry)
     _check_skills(config, report, skill_registry)
-    _check_commands(config, report)
     await _check_mcp(config, report, probe=probe, mcp_manager=mcp_manager)
     await _check_provider_probe(active_model, report, probe=probe, timeout=timeout, env=env)
     return report
@@ -252,35 +250,6 @@ def _check_skills(config: RuntimeConfig, report: DoctorReport, skill_registry: S
             report.add("WARN", "skills", item.name, item.reason or "skill disabled", source=item.source, path=item.path, plugin=item.plugin_name or "")
         elif item.status == "failed":
             report.add("WARN", "skills", item.name, item.reason or "skill failed to load", source=item.source, path=item.path, plugin=item.plugin_name or "")
-
-
-def _check_commands(config: RuntimeConfig, report: DoctorReport) -> None:
-    """检查命令 hook 配置是否能被解析和启用。"""
-    registry = CommandRegistry.from_settings(config.hooks, plugin_roots=config.skill_roots)
-    counts = registry.status_counts()
-    status: DiagnosticStatus = "WARN" if counts["failed"] or counts["disabled"] else "OK"
-    report.add(
-        status,
-        "commands",
-        "registry",
-        f"{counts['enabled']} enabled, {counts['disabled']} disabled, {counts['failed']} failed",
-        counts=counts,
-        commands=[item.command for item in registry.registrations if item.status == "enabled"],
-    )
-    for item in registry.registrations:
-        if item.status == "enabled":
-            continue
-        # disabled 也作为 WARN 展示，因为它可能代表插件声明了当前版本还不支持的 command。
-        report.add(
-            "WARN",
-            "commands",
-            item.id,
-            item.reason or item.status,
-            event=item.event,
-            matcher=item.matcher or "",
-            command=item.command,
-            source=item.source,
-        )
 
 
 async def _check_mcp(

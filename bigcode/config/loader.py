@@ -125,7 +125,6 @@ def load_runtime_config(
         models=models,
         workspace_roots=workspace_roots,
         permission_context=permission_context,
-        hooks=settings.get("hooks") or {},
         mcp_servers=mcp_servers,
         mcp_enabled=mcp_enabled,
         skill_roots=skill_roots,

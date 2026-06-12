@@ -20,7 +20,6 @@ from bigcode.context.messages import AssistantMessage, MessageBase, TextBlock, T
 from bigcode.context.normalizer import tool_run_result_to_message
 from bigcode.context.transcript import Transcript
 from bigcode.hooks.builtins import register_builtin_hooks
-from bigcode.hooks.command import command_hooks_from_settings
 from bigcode.hooks.models import HookInput
 from bigcode.hooks import HookBus
 from bigcode.mcp import McpClientManager
@@ -111,8 +110,6 @@ class AgentSession:
         self.event_sink = event_sink
         self.hook_bus = HookBus()
         register_builtin_hooks(self.hook_bus)
-        for handler in command_hooks_from_settings(config.hooks):
-            self.hook_bus.register(handler)
 
         # transcript 是完整消息流水账，snapshot 是可快速恢复的状态摘要。
         # 两者都保存，是为了兼顾“能恢复完整历史”和“能快速列出/恢复会话”。

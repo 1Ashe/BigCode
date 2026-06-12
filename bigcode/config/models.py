@@ -66,7 +66,6 @@ class RuntimeConfig:
     models: dict[str, ResolvedModel]
     workspace_roots: list[Path]
     permission_context: "ToolPermissionContext"
-    hooks: dict[str, Any]
     mcp_servers: dict[str, McpServerConfig]
     mcp_enabled: bool
     skill_roots: list[Path]
