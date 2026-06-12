@@ -29,7 +29,7 @@ from bigcode.skills import load_skills
 from bigcode.subagents.definitions import AgentDefinition
 from bigcode.subagents.tasks import AgentRunResult, AgentTaskState, AgentTaskStore, render_agent_result, result_to_dict
 from bigcode.tasks import TaskStore
-from bigcode.tools.artifacts.ArtifactRead import ArtifactRecord, ArtifactStore
+from bigcode.tools.artifacts import ArtifactStore
 from bigcode.tools import ToolExecutionContext, ToolRegistry, ToolRunner, ToolUse, build_default_registry
 from bigcode.tools.permissions import ToolPermissionContext, PermissionRule
 from bigcode.tools.read_file_state import ReadFileState
@@ -93,10 +93,9 @@ class AgentSession:
         self.messages: list[MessageBase] = []
 
         # 下面这些字段是 resume 时最需要恢复的会话状态：
-        # 文件快照保护编辑安全，技能/artifact/验证命令则影响后续上下文提醒。
+        # 文件快照保护编辑安全，技能/验证命令则影响后续上下文提醒。
         self.read_file_state = ReadFileState.from_snapshot(snapshot.read_file_snapshots) if snapshot else ReadFileState()
         self.loaded_skills: set[str] = set(snapshot.loaded_skills if snapshot else [])
-        self.active_artifacts: dict[str, dict[str, Any]] = dict(snapshot.active_artifacts if snapshot else {})
         self.last_verification: dict[str, Any] | None = snapshot.last_verification if snapshot else None
         self.abort_event = abort_event or threading.Event()
         self.plan_state = PlanModeState()
@@ -137,10 +136,10 @@ class AgentSession:
         ToolRunner 不直接依赖 AgentSession，而是通过这个轻量对象拿 cwd、权限、任务、技能、MCP 等能力。
         """
         # 这里没有复制状态对象，而是把同一批状态引用传给工具。
-        # 所以工具更新 read_file_state、plan_state、active_artifacts 时，AgentSession 能立刻看到。
+        # 所以工具更新 read_file_state、plan_state 等状态时，AgentSession 能立刻看到。
         return ToolExecutionContext(
             cwd=self.config.cwd,
-            workspace_roots=self.config.workspace_roots,
+            workspace_roots=_dedupe_paths([*self.config.workspace_roots, self.config.project_state_dir]),
             permission_context=self.permission_context,
             read_file_state=self.read_file_state,
             abort_event=self.abort_event,
@@ -156,7 +155,6 @@ class AgentSession:
             agent_session=self,
             event_sink=self.event_sink,
             artifact_store=self.artifact_store,
-            active_artifacts=self.active_artifacts,
             project_state_dir=self.config.project_state_dir,
         )
 
@@ -559,7 +557,6 @@ class AgentSession:
             print(f"sandbox profile: {self.config.sandbox_profile}")
             print(f"messages: {len(self.messages)}")
             print(f"loaded skills: {', '.join(sorted(self.loaded_skills)) if self.loaded_skills else '(none)'}")
-            print(f"artifacts: {len(self.active_artifacts)}")
             if self.last_verification:
                 print(f"last verification: {self.last_verification.get('command')} (exit {self.last_verification.get('exit_code')})")
             counts = self.agent_task_store.status_counts()
@@ -696,19 +693,6 @@ class AgentSession:
             self.loaded_skills.add(name)
             self._save_snapshot()
 
-    def record_artifact(self, record: ArtifactRecord) -> None:
-        """登记一个工具结果 artifact，保证后续 ArtifactRead 能确认它属于当前会话。"""
-        self.active_artifacts[record.artifact_id] = {
-            "artifact_id": record.artifact_id,
-            "artifact_path": record.artifact_path,
-            "original_chars": record.original_chars,
-            "session_id": record.session_id,
-            "tool_use_id": record.tool_use_id,
-            "tool_name": record.tool_name,
-            "created_at": record.created_at,
-        }
-        self._save_snapshot()
-
     def record_last_verification(self, *, command: str, exit_code: int | None) -> None:
         """记录最近一次看起来像测试/构建/检查的 Bash 命令及退出码。"""
         self.last_verification = {
@@ -740,7 +724,6 @@ class AgentSession:
                 message_count=len(self.messages),
                 read_file_snapshots=self.read_file_state.to_snapshot(),
                 loaded_skills=sorted(self.loaded_skills),
-                active_artifacts=self.active_artifacts,
                 last_verification=self.last_verification,
             ),
         )
@@ -755,6 +738,18 @@ def _clone_permission_context(ctx: ToolPermissionContext) -> ToolPermissionConte
         always_ask=[PermissionRule(**rule.__dict__) for rule in ctx.always_ask],
         should_avoid_permission_prompts=ctx.should_avoid_permission_prompts,
     )
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in paths:
+        resolved = path.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(resolved)
+    return out
 
 
 def _format_exception(exc: Exception) -> str:

@@ -113,7 +113,7 @@ def _artifact_metadata(result: ToolRunResult[Any]) -> dict[str, Any]:
     if result.output:
         metadata.update(result.output.metadata)
     out: dict[str, Any] = {}
-    for key in ("artifact_id", "artifact_path", "original_chars"):
+    for key in ("artifact_path", "original_chars"):
         if key in metadata:
             out[key] = metadata[key]
     return out

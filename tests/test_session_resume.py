@@ -125,7 +125,6 @@ class SessionResumeTests(unittest.TestCase):
                     task_list_id="sess_list",
                     transcript_path=str(state / "transcripts" / "sess_list.jsonl"),
                     message_count=3,
-                    active_artifacts={"toolu_1": {"artifact_id": "toolu_1"}},
                 ),
             )
 
@@ -140,7 +139,6 @@ class SessionResumeTests(unittest.TestCase):
             rendered = out.getvalue()
             self.assertIn("sess_list", rendered)
             self.assertIn("messages", rendered)
-            self.assertIn("artifacts", rendered)
 
     def test_skill_load_and_bash_verification_update_snapshot(self) -> None:
         class FakeBashTool(BaseTool[BashInput, dict]):

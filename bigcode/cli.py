@@ -86,7 +86,7 @@ def _render_resume_list(items: list[SessionListItem]) -> str:
     """把可恢复会话列表渲染成制表符分隔文本。"""
     if not items:
         return "No resumable sessions.\n"
-    lines = ["id\tupdated_at\tmodel\tmessages\tartifacts\tcwd"]
+    lines = ["id\tupdated_at\tmodel\tmessages\tcwd"]
     for item in items:
         lines.append(
             "\t".join(
@@ -95,7 +95,6 @@ def _render_resume_list(items: list[SessionListItem]) -> str:
                     _format_time(item.updated_at),
                     item.model or "",
                     str(item.message_count),
-                    str(item.artifact_count),
                     item.cwd,
                 ]
             )

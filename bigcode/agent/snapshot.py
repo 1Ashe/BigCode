@@ -31,7 +31,6 @@ class SessionSnapshot:
     message_count: int
     read_file_snapshots: list[dict[str, Any]] = field(default_factory=list)
     loaded_skills: list[str] = field(default_factory=list)
-    active_artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_verification: dict[str, Any] | None = None
     updated_at: float = field(default_factory=time.time)
     version: int = SNAPSHOT_VERSION
@@ -47,7 +46,6 @@ class SessionListItem:
     cwd: str
     model: str | None
     message_count: int
-    artifact_count: int
     updated_at: float
     transcript_path: str
     snapshot_path: str | None = None
@@ -93,7 +91,6 @@ def list_session_snapshots(project_state_dir: Path) -> list[SessionListItem]:
                 cwd=snapshot.cwd,
                 model=snapshot.model,
                 message_count=snapshot.message_count,
-                artifact_count=len(snapshot.active_artifacts),
                 updated_at=snapshot.updated_at,
                 transcript_path=snapshot.transcript_path,
                 snapshot_path=str(path),
@@ -116,7 +113,6 @@ def list_session_snapshots(project_state_dir: Path) -> list[SessionListItem]:
                 cwd="",
                 model=None,
                 message_count=len(read_jsonl(path)),
-                artifact_count=0,
                 updated_at=updated_at,
                 transcript_path=str(path),
                 snapshot_path=None,
@@ -133,9 +129,6 @@ def _snapshot_from_dict(data: dict[str, Any]) -> SessionSnapshot | None:
         return None
 
     # 下面几个字段历史上可能不存在或类型不对，统一降级为空结构。
-    active_artifacts = data.get("active_artifacts") or {}
-    if not isinstance(active_artifacts, dict):
-        active_artifacts = {}
     read_file_snapshots = data.get("read_file_snapshots") or []
     if not isinstance(read_file_snapshots, list):
         read_file_snapshots = []
@@ -156,7 +149,6 @@ def _snapshot_from_dict(data: dict[str, Any]) -> SessionSnapshot | None:
         message_count=_int_or_zero(data.get("message_count")),
         read_file_snapshots=[item for item in read_file_snapshots if isinstance(item, dict)],
         loaded_skills=[str(item) for item in loaded_skills if isinstance(item, str)],
-        active_artifacts={str(key): value for key, value in active_artifacts.items() if isinstance(value, dict)},
         last_verification=last_verification,
         updated_at=float(data.get("updated_at") or 0.0),
         version=_int_or_zero(data.get("version")) or SNAPSHOT_VERSION,

@@ -82,7 +82,6 @@ def build_default_registry() -> ToolRegistry:
     """创建 BigCode 默认工具注册表。"""
     # 这些 import 放在函数里面，是为了避免模块导入阶段形成循环依赖。
     # 只有真正构建默认 registry 时，才需要把所有工具类都加载进来。
-    from .artifacts.ArtifactRead import ArtifactReadTool
     from .bash.Bash import BashTool
     from .edit.Edit import EditTool
     from .glob.Glob import GlobTool
@@ -125,7 +124,6 @@ def build_default_registry() -> ToolRegistry:
         BashTool(),
         WebFetchTool(),
         WebSearchTool(),
-        ArtifactReadTool(),
         TaskCreateTool(),
         TaskUpdateTool(),
         TaskListTool(),

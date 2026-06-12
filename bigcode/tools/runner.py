@@ -18,7 +18,7 @@ from pydantic import ValidationError
 from bigcode.hooks.models import HookInput
 
 from .base import PermissionDecision, ToolExecutionContext, ToolRunResult
-from .artifacts.ArtifactRead import serialized_chars
+from .artifacts import serialized_chars
 from .output_limits import limit_tool_run_result
 from .permissions import build_permission_target, classify_bash, decide_permission
 from .registry import ToolRegistry
@@ -383,10 +383,7 @@ class ToolRunner:
         if original_chars <= max_chars:
             return
 
-        # artifact_id 直接使用 tool_use_id。这样模型拿到 tool_result 后，
-        # 可以用同一个 id 通过 ArtifactRead 找回完整结果。
         record = ctx.artifact_store.write_tool_output(
-            artifact_id=result.tool_use_id,
             tool_use_id=result.tool_use_id,
             tool_name=result.tool_name,
             output=result.output.data,
@@ -396,7 +393,6 @@ class ToolRunner:
             error_message=result.error_message,
         )
         metadata = {
-            "artifact_id": record.artifact_id,
             "artifact_path": record.artifact_path,
             "original_chars": record.original_chars,
         }
@@ -405,19 +401,6 @@ class ToolRunner:
         # normalizer 会合并两边 metadata，event/UI 层也可能直接看 run_result.metadata。
         result.metadata = {**result.metadata, **metadata}
         result.output.metadata = {**result.output.metadata, **metadata}
-        if ctx.active_artifacts is not None:
-            # active_artifacts 是当前会话允许读取的 artifact 白名单。
-            # ArtifactRead 会检查这里，防止模型随便读其它 session 的结果文件。
-            ctx.active_artifacts[record.artifact_id] = {
-                **metadata,
-                "session_id": record.session_id,
-                "tool_use_id": record.tool_use_id,
-                "tool_name": record.tool_name,
-                "created_at": record.created_at,
-            }
-        if ctx.agent_session and hasattr(ctx.agent_session, "record_artifact"):
-            # AgentSession 会把 artifact 也写进 snapshot，resume 后仍可读取。
-            ctx.agent_session.record_artifact(record)
 
     def _record_metadata_carryover(self, tool_name: str, tool_input: dict[str, Any], result: ToolRunResult[Any], ctx: ToolExecutionContext) -> None:
         """把工具结果带来的会话状态变化同步回 AgentSession。

@@ -99,7 +99,6 @@ class ToolExecutionContext:
     agent_session: Any | None = None
     event_sink: Any | None = None
     artifact_store: Any | None = None
-    active_artifacts: dict[str, dict[str, Any]] | None = None
     project_state_dir: Path | None = None
 
 
