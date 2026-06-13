@@ -590,6 +590,8 @@ class AgentSession:
             # 手动压缩只改变当前内存里的 messages；之后 append transcript 时会继续记录新消息。
             compacted = await apply_context_compact(self.messages, max_messages=40)
             self.messages = compacted.projected_messages
+            self.read_file_state.clear()
+            self._save_snapshot()
             print(f"Compacted messages: {len(self.messages)}")
             return False
         print(f"Unknown command: {cmd}")

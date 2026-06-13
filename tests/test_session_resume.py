@@ -20,6 +20,7 @@ from bigcode.models.claude_compatible import ModelResponse
 from bigcode.skills.loader import load_skills
 from bigcode.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from bigcode.tools.bash.Bash import BashInput
+from bigcode.tools.edit.Edit import EditInput, EditTool
 from bigcode.tools.read.Read import ReadInput, ReadTool
 from bigcode.tools.registry import ToolRegistry
 from bigcode.tools.runner import ToolRunner, ToolUse
@@ -110,6 +111,34 @@ class SessionResumeTests(unittest.TestCase):
             third = asyncio.run(ReadTool().call(ReadInput(file_path="a.txt"), resumed.make_tool_context()))
             self.assertEqual(third.data["type"], "text")
             self.assertIn("changed", third.data["content"])
+
+    def test_compact_clears_read_file_state_and_requires_reread_before_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            home = Path(td) / "home"
+            root.mkdir()
+            path = root / "a.txt"
+            path.write_text("hello\n", encoding="utf-8")
+            config = self.make_config(root, home)
+            session = AgentSession(config, session_id="sess_compact_read", non_interactive=True)
+            session.permission_context.mode = "bypassPermissions"
+            ctx = session.make_tool_context()
+
+            first = asyncio.run(ReadTool().call(ReadInput(file_path="a.txt"), ctx))
+            self.assertEqual(first.data["type"], "text")
+            self.assertEqual(len(session.read_file_state.snapshots()), 1)
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                asyncio.run(session.handle_command("/compact"))
+
+            self.assertEqual(session.read_file_state.snapshots(), [])
+            with self.assertRaisesRegex(RuntimeError, "read before editing"):
+                asyncio.run(EditTool().call(EditInput(file_path="a.txt", old_string="hello", new_string="hi"), session.make_tool_context()))
+
+            asyncio.run(ReadTool().call(ReadInput(file_path="a.txt"), session.make_tool_context()))
+            asyncio.run(EditTool().call(EditInput(file_path="a.txt", old_string="hello", new_string="hi"), session.make_tool_context()))
+            self.assertEqual(path.read_text(encoding="utf-8"), "hi\n")
 
     def test_resume_without_id_lists_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as td:

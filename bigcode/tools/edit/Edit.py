@@ -89,5 +89,5 @@ class EditTool(BaseTool[EditInput, dict]):
             tmp = resolved.resolved.with_suffix(resolved.resolved.suffix + ".tmp")
             tmp.write_text(new_content, encoding="utf-8")
             tmp.replace(resolved.resolved)
-            snapshot = ctx.read_file_state.refresh_after_write(resolved.resolved)
+            snapshot = ctx.read_file_state.refresh_after_write(resolved.resolved, new_content)
         return ToolResult({"file_path": str(resolved.resolved), "replacements": count if input.replace_all else 1}, {"snapshot": snapshot})

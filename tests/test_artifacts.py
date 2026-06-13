@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from bigcode.context.normalizer import tool_run_result_to_message
 from bigcode.tools.artifacts import ArtifactStore
 from bigcode.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from bigcode.tools.edit.Edit import EditInput, EditTool
 from bigcode.tools.permissions import ToolPermissionContext
 from bigcode.tools.read.Read import ReadInput, ReadTool
 from bigcode.tools.read_file_state import ReadFileState
@@ -81,6 +82,28 @@ class ArtifactTests(unittest.TestCase):
             read_ctx.workspace_roots.append((root / ".state").resolve(strict=False))
             out = asyncio.run(ReadTool().call(ReadInput(file_path=record.artifact_path), read_ctx))
             self.assertIn("full output", out.data["content"])
+
+    def test_large_read_offload_does_not_count_as_full_source_read(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "large.txt"
+            path.write_text("needle\n" + ("x" * 130_000), encoding="utf-8")
+            ctx = self.make_ctx(root, session_id="sess_read_large")
+            ctx.permission_context.mode = "bypassPermissions"
+            registry = ToolRegistry()
+            registry.register(ReadTool())
+
+            result = asyncio.run(ToolRunner(registry).run_one(ToolUse("toolu_read", "Read", {"file_path": "large.txt"}), ctx))
+
+            self.assertFalse(result.is_error)
+            self.assertTrue(Path(result.metadata["artifact_path"]).exists())
+            snap = ctx.read_file_state.get_snapshot(path)
+            self.assertIsNotNone(snap)
+            self.assertTrue(snap.is_partial_view)
+            self.assertIsNone(snap.offset)
+            self.assertIsNone(snap.limit)
+            with self.assertRaisesRegex(RuntimeError, "fully read"):
+                asyncio.run(EditTool().call(EditInput(file_path="large.txt", old_string="needle", new_string="changed"), ctx))
 
 
 if __name__ == "__main__":

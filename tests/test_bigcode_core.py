@@ -38,6 +38,7 @@ from bigcode.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from bigcode.tools.base import EmptyInput
 from bigcode.tools.permissions import ToolPermissionContext, classify_bash, decide_permission
 from bigcode.tools.read_file_state import ReadFileState
+from bigcode.tools.edit.Edit import EditInput, EditTool
 from bigcode.tools.read.Read import ReadInput, ReadTool
 from bigcode.tools.registry import ToolRegistry, build_default_registry
 from bigcode.tools.runner import ToolRunner, ToolUse, _format_permission_prompt
@@ -272,6 +273,10 @@ class BigCodeCoreTests(unittest.TestCase):
             self.assertEqual(second.data["type"], "file_unchanged")
             write = WriteTool()
             asyncio.run(write.call(WriteInput(file_path="a.txt", content="changed\n"), ctx))
+            snap = ctx.read_file_state.get_snapshot(path)
+            self.assertIsNotNone(snap)
+            self.assertFalse(snap.is_partial_view)
+            self.assertEqual(snap.content, "changed\n")
             third = asyncio.run(read.call(ReadInput(file_path="a.txt"), ctx))
             self.assertEqual(third.data["type"], "text")
             self.assertIn("changed", third.data["content"])
@@ -293,6 +298,58 @@ class BigCodeCoreTests(unittest.TestCase):
             fourth = asyncio.run(read.call(ReadInput(file_path="a.txt", offset=1, limit=1), ctx))
             self.assertEqual(fourth.data["type"], "text")
             self.assertIn("changed", fourth.data["content"])
+
+    def test_partial_read_does_not_allow_edit_or_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            path = root / "a.txt"
+            path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+            ctx = self.make_ctx(root, mode="bypassPermissions")
+            asyncio.run(ReadTool().call(ReadInput(file_path="a.txt", offset=0, limit=1), ctx))
+
+            with self.assertRaisesRegex(RuntimeError, "fully read"):
+                asyncio.run(EditTool().call(EditInput(file_path="a.txt", old_string="one", new_string="ONE"), ctx))
+            with self.assertRaisesRegex(RuntimeError, "fully read"):
+                asyncio.run(WriteTool().call(WriteInput(file_path="a.txt", content="changed\n"), ctx))
+
+    def test_existing_file_write_requires_full_read_in_relaxed_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            path = root / "a.txt"
+            path.write_text("old\n", encoding="utf-8")
+            for mode in ("default", "acceptEdits", "bypassPermissions"):
+                with self.subTest(mode=mode):
+                    ctx = self.make_ctx(root, mode=mode)
+                    with self.assertRaisesRegex(RuntimeError, "read before editing"):
+                        asyncio.run(WriteTool().call(WriteInput(file_path="a.txt", content="new\n"), ctx))
+
+    def test_new_file_write_records_full_snapshot_without_prior_read(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            ctx = self.make_ctx(root, mode="bypassPermissions")
+
+            asyncio.run(WriteTool().call(WriteInput(file_path="new.txt", content="created\n"), ctx))
+
+            snap = ctx.read_file_state.get_snapshot(root / "new.txt")
+            self.assertIsNotNone(snap)
+            self.assertEqual(snap.content, "created\n")
+            self.assertEqual(snap.source, "write")
+            self.assertFalse(snap.is_partial_view)
+            self.assertIsNone(snap.offset)
+            self.assertIsNone(snap.limit)
+
+    def test_mtime_change_with_same_content_still_allows_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            path = root / "a.txt"
+            path.write_text("one\n", encoding="utf-8")
+            ctx = self.make_ctx(root, mode="bypassPermissions")
+            asyncio.run(ReadTool().call(ReadInput(file_path="a.txt"), ctx))
+
+            path.write_text("one\n", encoding="utf-8")
+            asyncio.run(EditTool().call(EditInput(file_path="a.txt", old_string="one", new_string="two"), ctx))
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "two\n")
 
     def test_plan_mode_denies_write_permission(self) -> None:
         with tempfile.TemporaryDirectory() as td:

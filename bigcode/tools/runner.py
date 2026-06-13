@@ -401,6 +401,10 @@ class ToolRunner:
         # normalizer 会合并两边 metadata，event/UI 层也可能直接看 run_result.metadata。
         result.metadata = {**result.metadata, **metadata}
         result.output.metadata = {**result.output.metadata, **metadata}
+        if result.tool_name == "Read" and isinstance(result.output.data, dict):
+            file_path = result.output.data.get("file_path")
+            if isinstance(file_path, str):
+                ctx.read_file_state.mark_partial_view(Path(file_path))
 
     def _record_metadata_carryover(self, tool_name: str, tool_input: dict[str, Any], result: ToolRunResult[Any], ctx: ToolExecutionContext) -> None:
         """把工具结果带来的会话状态变化同步回 AgentSession。

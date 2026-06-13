@@ -95,7 +95,8 @@ class ReadTool(BaseTool[ReadInput, dict]):
             resolved.resolved,
             make_snapshot(
                 resolved.resolved,
-                content_digest=digest_text(content),
+                content=raw if not partial else content,
+                content_digest=digest_text(raw if not partial else content),
                 offset=input.offset,
                 limit=input.limit,
                 source="read",

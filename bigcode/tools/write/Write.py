@@ -74,14 +74,11 @@ class WriteTool(BaseTool[WriteInput, dict]):
             raise RuntimeError("Write target is outside workspace.")
         lock = ctx.read_file_state.lock_for(resolved.resolved)
         with lock:
-            if resolved.exists and ctx.permission_context.mode not in {"acceptEdits", "bypassPermissions"}:
-                snap = ctx.read_file_state.get_snapshot(resolved.resolved)
-                if not snap:
-                    raise RuntimeError("Refusing to overwrite a file that has not been read.")
+            if resolved.exists:
                 ctx.read_file_state.validate_unchanged(resolved.resolved)
             resolved.parent_resolved.mkdir(parents=True, exist_ok=True)
             tmp = resolved.resolved.with_suffix(resolved.resolved.suffix + ".tmp")
             tmp.write_text(input.content, encoding="utf-8")
             tmp.replace(resolved.resolved)
-            snapshot = ctx.read_file_state.refresh_after_write(resolved.resolved)
+            snapshot = ctx.read_file_state.refresh_after_write(resolved.resolved, input.content)
         return ToolResult({"file_path": str(resolved.resolved), "bytes": len(input.content.encode("utf-8"))}, {"snapshot": snapshot})
