@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from bigcode.tools.base import ToolRunResult
@@ -16,6 +17,7 @@ from .messages import (
     ContextSummaryMessage,
     MessageBase,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -27,8 +29,17 @@ def attachment_to_user_message(att: Attachment) -> UserMessage:
     return UserMessage(wrap_system_reminder(att.text), is_meta=True, origin=att.source)
 
 
-def normalize_messages_for_api(system_prompt: str, messages: list[MessageBase]) -> list[ApiMessage]:
-    """把内部消息流投影成 Claude Messages API 格式。
+def normalize_messages_for_api(system_prompt: str, messages: list[MessageBase], *, protocol: str = "anthropic") -> list[Any]:
+    """把内部消息流投影成目标 Provider API 格式。"""
+    if protocol == "anthropic":
+        return _normalize_messages_for_anthropic(system_prompt, messages)
+    if protocol == "openai":
+        return _normalize_messages_for_openai(system_prompt, messages)
+    raise ValueError(f"Unknown protocol: {protocol}")
+
+
+def _normalize_messages_for_anthropic(system_prompt: str, messages: list[MessageBase]) -> list[ApiMessage]:
+    """把内部消息流投影成 Anthropic Messages API 格式。
 
     重点是维护 pending_tool_use_ids，确保 assistant 的 tool_use 后紧跟 user 的 tool_result。
     """
@@ -76,7 +87,10 @@ def normalize_messages_for_api(system_prompt: str, messages: list[MessageBase]) 
                 pending_tool_use_ids.clear()
             blocks = []
             for block in msg.content:
-                if isinstance(block, TextBlock):
+                if isinstance(block, ThinkingBlock):
+                    if block.thinking:
+                        blocks.append({"type": "thinking", "thinking": block.thinking, "signature": block.signature})
+                elif isinstance(block, TextBlock):
                     if block.text:
                         blocks.append({"type": "text", "text": block.text})
                 elif isinstance(block, ToolUseBlock):
@@ -93,6 +107,73 @@ def normalize_messages_for_api(system_prompt: str, messages: list[MessageBase]) 
     if pending_tool_use_ids:
         api.append(ApiMessage(role="user", content=_missing_tool_result_blocks(pending_tool_use_ids)))
     return _merge_adjacent_users(api)
+
+
+def _normalize_messages_for_openai(system_prompt: str, messages: list[MessageBase]) -> list[dict[str, Any]]:
+    """把内部消息流投影成 OpenAI Responses API input 格式。"""
+    _ = system_prompt
+    result: list[dict[str, Any]] = []
+
+    for msg in messages:
+        if isinstance(msg, UserMessage):
+            text_parts: list[str] = []
+            def flush_user_text() -> None:
+                if text_parts:
+                    result.append({"role": "user", "content": "\n".join(text_parts)})
+                    text_parts.clear()
+
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    if block.text:
+                        text_parts.append(block.text)
+                elif isinstance(block, ToolResultBlock):
+                    flush_user_text()
+                    result.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": block.tool_use_id,
+                            "output": json.dumps(
+                                {
+                                    "content": _stringify_tool_content(block.content, is_error=block.is_error),
+                                    "is_error": block.is_error,
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        }
+                    )
+                elif isinstance(block, ToolUseBlock):
+                    text_parts.append(f"Unexpected tool_use block in user message: {block.name}")
+            flush_user_text()
+        elif isinstance(msg, AssistantMessage):
+            text_parts: list[str] = []
+            def flush_assistant_text() -> None:
+                if text_parts:
+                    result.append({"role": "assistant", "content": "\n".join(text_parts)})
+                    text_parts.clear()
+
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    if block.text:
+                        text_parts.append(block.text)
+                elif isinstance(block, ToolUseBlock):
+                    flush_assistant_text()
+                    result.append(
+                        {
+                            "type": "function_call",
+                            "call_id": block.id,
+                            "name": block.name,
+                            "arguments": json.dumps(
+                                to_jsonable(block.input),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        }
+                    )
+            flush_assistant_text()
+        elif isinstance(msg, ContextSummaryMessage):
+            result.append({"role": "user", "content": wrap_system_reminder(msg.summary)})
+    return result
 
 
 def tool_run_result_to_message(result: ToolRunResult[Any]) -> UserMessage:

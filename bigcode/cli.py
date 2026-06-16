@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import sys
 import time
 from pathlib import Path
@@ -69,17 +70,20 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "run":
         if not args.arg:
             raise SystemExit("bigcode run requires a prompt argument")
-        result = asyncio.run(_run_once(session, args.arg))
-        if result.assistant_text and args.event_stream == "off":
+        display_stream = args.event_stream == "off"
+        result = asyncio.run(_run_once(session, args.arg, display_stream=display_stream))
+        if result.assistant_text and args.event_stream == "off" and not display_stream:
             print(result.assistant_text)
         return
     asyncio.run(session.run_repl())
 
 
-async def _run_once(session: AgentSession, prompt: str):
+async def _run_once(session: AgentSession, prompt: str, *, display_stream: bool = False):
     """启动 session 并执行一次非交互式 prompt。"""
     await session.start()
-    return await session.run_turn(prompt)
+    if "display_stream" not in inspect.signature(session.run_turn).parameters:
+        return await session.run_turn(prompt)
+    return await session.run_turn(prompt, display_stream=display_stream)
 
 
 def _render_resume_list(items: list[SessionListItem]) -> str:

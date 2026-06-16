@@ -183,12 +183,13 @@ def _check_models(
         "OK",
         "provider",
         "active profile",
-        f"{model.provider_type} provider {model.provider!r} -> model id {model.model_id!r}",
+        f"{model.protocol} provider {model.provider!r} -> model id {model.model_id!r}",
         base_url=model.base_url,
         api_key_env=model.api_key_env or "(none)",
         capabilities=_capabilities(model),
         context_window=model.context_window,
         max_output_tokens=model.max_output_tokens,
+        protocol=model.protocol,
     )
     if model.api_key_env:
         # 如果配置了 api_key_env，优先看环境变量；但某些 provider 也允许
@@ -311,28 +312,39 @@ async def _check_provider_probe(
     except Exception as exc:
         report.add("ERROR", "provider", "probe", f"provider request failed: {_format_exception(exc)}")
         return
-    report.add("OK", "provider", "probe", "provider accepted a minimal Claude-compatible messages request")
+    report.add("OK", "provider", "probe", f"provider accepted a minimal {model.protocol} request")
 
 
 async def probe_provider(model: ResolvedModel, *, timeout: float = 10.0, env: dict[str, str] | None = None) -> dict[str, Any]:
-    """向模型 provider 发一个最小 messages 请求，验证 base_url、鉴权和协议是否可用。"""
+    """向模型 provider 发一个最小请求，验证 base_url、鉴权和协议是否可用。"""
     env = env or os.environ
     api_key = env.get(model.api_key_env or "")
-    headers = {"anthropic-version": "2023-06-01"}
-    if api_key:
-        headers["x-api-key"] = api_key
+    headers = dict(model.default_headers)
+    if model.protocol == "anthropic":
+        headers.setdefault("anthropic-version", "2023-06-01")
+        if api_key:
+            headers["x-api-key"] = api_key
+    elif model.protocol == "openai":
+        if api_key and not _has_auth_header(headers):
+            headers["authorization"] = f"Bearer {api_key}"
+    else:
+        raise RuntimeError(f"unsupported protocol {model.protocol!r}")
     headers.update(model.default_headers)
     if model.api_key_env and not api_key and not _has_auth_header(headers):
         raise RuntimeError(f"missing API key environment variable {model.api_key_env}")
-    url = f"{model.base_url.rstrip('/')}/messages"
 
-    # max_tokens=1 的 ping 请求成本低，但能验证 URL、模型 id、鉴权和 Claude Messages 协议。
-    payload = {
-        "model": model.model_id,
-        "system": "BigCode doctor probe.",
-        "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
-        "max_tokens": 1,
-    }
+    if model.protocol == "openai":
+        url = f"{model.base_url.rstrip('/')}/responses"
+        payload = {"model": model.model_id, "input": "ping", "max_output_tokens": 1}
+    else:
+        url = f"{model.base_url.rstrip('/')}/messages"
+        # max_tokens=1 的 ping 请求成本低，但能验证 URL、模型 id、鉴权和 Anthropic Messages 协议。
+        payload = {
+            "model": model.model_id,
+            "system": "BigCode doctor probe.",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+            "max_tokens": 1,
+        }
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(url, headers=headers, json=payload)
         response.raise_for_status()

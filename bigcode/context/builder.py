@@ -5,14 +5,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
 
+from bigcode.config.models import CompactConfig
 from bigcode.hooks.models import HookInput
 
 from .attachments import Attachment
-from .compact import ContextCompactResult, apply_context_compact
+from .compact import CompactDeps, ContextCompactResult, ContextCompactState, apply_context_compact
 from .messages import ApiMessage, MessageBase
 from .normalizer import attachment_to_user_message, normalize_messages_for_api
-from .system_prompt import build_system_prompt
 
 
 @dataclass
@@ -31,6 +32,14 @@ class ContextBuildDeps:
     task_store: object | None = None
     task_list_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
+    system_prompt: str = ""
+    compact_config: CompactConfig = field(default_factory=CompactConfig)
+    compact_state: ContextCompactState = field(default_factory=ContextCompactState)
+    context_window: int = 128000
+    tool_schemas: list[dict] = field(default_factory=list)
+    summary_callback: Callable[[str, str], Awaitable[str]] | None = None
+    is_main_thread: bool = True
+    protocol: str = "anthropic"
 
 
 @dataclass
@@ -38,7 +47,7 @@ class ContextBuildResult:
     """上下文构建结果，包含 system_prompt、内部上下文消息、API 消息和压缩信息。"""
     system_prompt: str
     context_messages: list[MessageBase]
-    api_messages: list[ApiMessage]
+    api_messages: list[Any]
     compact_result: ContextCompactResult
     attachments: list[Attachment] = field(default_factory=list)
 
@@ -46,9 +55,8 @@ class ContextBuildResult:
 async def build_context_for_api(messages: list[MessageBase], deps: ContextBuildDeps) -> ContextBuildResult:
     """构建模型请求上下文的主入口。
 
-    它先压缩历史，再运行 ContextBuild hook 注入附件，最后组装 system prompt 并转换 API 消息。
+    它先重建动态附件预算，再压缩历史，最后使用冻结的 system prompt 转换 API 消息。
     """
-    compact_result = await apply_context_compact(messages)
     attachments: list[Attachment] = []
     if deps.hook_bus:
         # ContextBuild hook 可以向模型上下文注入动态信息，例如当前任务列表、
@@ -71,21 +79,47 @@ async def build_context_for_api(messages: list[MessageBase], deps: ContextBuildD
         )
         attachments.extend(agg.attachments)
 
+    attachment_messages = [attachment_to_user_message(att) for att in attachments]
+    if deps.hook_bus:
+        await deps.hook_bus.emit(
+            "PreCompact",
+            HookInput(
+                hook_event_name="PreCompact",
+                session_id=deps.session_id,
+                cwd=str(deps.cwd),
+                permission_mode=deps.permission_mode,
+            ),
+        )
+    compact_result = await apply_context_compact(
+        messages,
+        CompactDeps(
+            config=deps.compact_config,
+            state=deps.compact_state,
+            context_window=deps.context_window,
+            system_prompt=deps.system_prompt,
+            tool_schemas=deps.tool_schemas,
+            extra_context_messages=attachment_messages,
+            is_main_thread=deps.is_main_thread,
+            summarize=deps.summary_callback,
+        ),
+    )
+    if deps.hook_bus and compact_result.records_to_append:
+        await deps.hook_bus.emit(
+            "PostCompact",
+            HookInput(
+                hook_event_name="PostCompact",
+                session_id=deps.session_id,
+                cwd=str(deps.cwd),
+                permission_mode=deps.permission_mode,
+                payload={"compact_result": compact_result},
+            ),
+        )
+
     # compact_result.projected_messages 是本次模型请求真正使用的消息历史；
     # 不一定等于 self.messages，因为可能已经被压缩过。
     context_messages = list(compact_result.projected_messages)
-    context_messages.extend(attachment_to_user_message(att) for att in attachments)
-
-    # system prompt 每次都重新生成，因为日期、工具列表、Plan Mode 状态、
-    # 项目说明文件等都有可能变化。
-    system_prompt = build_system_prompt(
-        cwd=deps.cwd,
-        tool_names=deps.tool_names,
-        instruction_paths=deps.instruction_paths,
-        plan_active=bool(getattr(deps.plan_mode_state, "active", False)),
-        plan_file=getattr(deps.plan_mode_state, "plan_file", None),
-    ).render()
+    context_messages.extend(attachment_messages)
 
     # 最后一步才把内部消息转 API 格式，这样前面的 hook/compact 都能使用内部结构。
-    api_messages = normalize_messages_for_api(system_prompt, context_messages)
-    return ContextBuildResult(system_prompt, context_messages, api_messages, compact_result, attachments)
+    api_messages = normalize_messages_for_api(deps.system_prompt, context_messages, protocol=deps.protocol)
+    return ContextBuildResult(deps.system_prompt, context_messages, api_messages, compact_result, attachments)

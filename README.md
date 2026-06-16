@@ -13,3 +13,4 @@ At minimum, configure an OpenAI-compatible model in `.bigcode/models.json` or `~
 
 FastMCP support is optional. If `fastmcp` is not installed, MCP tools report a clear dependency error while local tools, skills, plans, tasks, and the REPL continue to work.
 
+# BigCode

@@ -11,6 +11,7 @@ from unittest.mock import patch
 from bigcode.agent.session import AgentSession
 from bigcode.config import load_runtime_config
 from bigcode.context.messages import AssistantMessage, TextBlock
+from bigcode.context.messages import SystemPromptSnapshotMessage
 from bigcode.hooks.bus import HookHandler
 from bigcode.hooks.models import HookInput, HookOutput
 from bigcode.models.claude_compatible import ModelResponse
@@ -217,7 +218,8 @@ class BackgroundSubagentTests(unittest.TestCase):
             sidechain = Path(hook.inputs[0].payload["sidechain_path"])
             self.assertTrue(sidechain.exists())
             self.assertGreaterEqual(len(sidechain.read_text(encoding="utf-8").splitlines()), 2)
-            self.assertEqual(session.messages, [])
+            self.assertEqual(len(session.messages), 1)
+            self.assertIsInstance(session.messages[0], SystemPromptSnapshotMessage)
 
     def test_task_output_validation_and_plan_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -12,7 +12,7 @@ from typing import Any
 from bigcode.utils.jsonio import read_json_file, read_jsonl, to_jsonable, write_json_file
 
 
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 
 
 @dataclass
@@ -32,6 +32,9 @@ class SessionSnapshot:
     read_file_snapshots: list[dict[str, Any]] = field(default_factory=list)
     loaded_skills: list[str] = field(default_factory=list)
     last_verification: dict[str, Any] | None = None
+    system_prompt: str | None = None
+    compact_auto_failures: int = 0
+    compact_turn_index: int = 0
     updated_at: float = field(default_factory=time.time)
     version: int = SNAPSHOT_VERSION
 
@@ -150,6 +153,9 @@ def _snapshot_from_dict(data: dict[str, Any]) -> SessionSnapshot | None:
         read_file_snapshots=[item for item in read_file_snapshots if isinstance(item, dict)],
         loaded_skills=[str(item) for item in loaded_skills if isinstance(item, str)],
         last_verification=last_verification,
+        system_prompt=str(data["system_prompt"]) if data.get("system_prompt") else None,
+        compact_auto_failures=_int_or_zero(data.get("compact_auto_failures")),
+        compact_turn_index=_int_or_zero(data.get("compact_turn_index")),
         updated_at=float(data.get("updated_at") or 0.0),
         version=_int_or_zero(data.get("version")) or SNAPSHOT_VERSION,
     )

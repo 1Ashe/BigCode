@@ -4,6 +4,6 @@
 """
 
 from .loader import load_runtime_config
-from .models import ModelCapabilities, ResolvedModel, RuntimeConfig
+from .models import CompactConfig, ModelCapabilities, ModelProtocol, ResolvedModel, RuntimeConfig
 
-__all__ = ["ModelCapabilities", "ResolvedModel", "RuntimeConfig", "load_runtime_config"]
+__all__ = ["CompactConfig", "ModelCapabilities", "ModelProtocol", "ResolvedModel", "RuntimeConfig", "load_runtime_config"]

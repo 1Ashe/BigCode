@@ -33,6 +33,16 @@ class ToolUseBlock(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
 
 
+class ThinkingBlock(BaseModel):
+    """Anthropic thinking 内容块。
+
+    signature 是 Provider 返回的校验串，重放到 Anthropic 历史时需要保留。
+    """
+    type: Literal["thinking"] = "thinking"
+    thinking: str
+    signature: str = ""
+
+
 class ToolResultBlock(BaseModel):
     """工具执行结果内容块。
 
@@ -44,7 +54,8 @@ class ToolResultBlock(BaseModel):
     is_error: bool = False
 
 
-ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock
+ContentBlock = TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock
+CompactType = Literal["snip", "time_micro", "collapse", "auto"]
 
 
 @dataclass
@@ -68,9 +79,23 @@ class UserMessage(MessageBase):
     """
     content: list[ContentBlock] = field(default_factory=list)
 
-    def __init__(self, content: str | list[ContentBlock], *, is_meta: bool = False, origin: str = "user") -> None:
+    def __init__(
+        self,
+        content: str | list[ContentBlock],
+        *,
+        is_meta: bool = False,
+        origin: str = "user",
+        uuid: str | None = None,
+        timestamp: float | None = None,
+    ) -> None:
         """创建用户消息；字符串会自动包装成一个 TextBlock。"""
-        super().__init__(type="user", is_meta=is_meta, origin=origin)
+        super().__init__(
+            type="user",
+            uuid=uuid or new_id("msg"),
+            timestamp=time.time() if timestamp is None else timestamp,
+            is_meta=is_meta,
+            origin=origin,
+        )
         self.content = [TextBlock(text=content)] if isinstance(content, str) else content
 
 
@@ -92,9 +117,16 @@ class AssistantMessage(MessageBase):
         model: str | None = None,
         stop_reason: str | None = None,
         usage: dict[str, Any] | None = None,
+        uuid: str | None = None,
+        timestamp: float | None = None,
     ) -> None:
         """创建助手消息，并保存模型名、停止原因和 token usage。"""
-        super().__init__(type="assistant", origin="model")
+        super().__init__(
+            type="assistant",
+            uuid=uuid or new_id("msg"),
+            timestamp=time.time() if timestamp is None else timestamp,
+            origin="model",
+        )
         self.content = content
         self.model = model
         self.stop_reason = stop_reason
@@ -111,9 +143,22 @@ class SystemMessage(MessageBase):
     subtype: str = "info"
     level: str = "info"
 
-    def __init__(self, content: str, *, subtype: str = "info", level: str = "info") -> None:
+    def __init__(
+        self,
+        content: str,
+        *,
+        subtype: str = "info",
+        level: str = "info",
+        uuid: str | None = None,
+        timestamp: float | None = None,
+    ) -> None:
         """创建系统消息，用 subtype/level 描述消息用途和严重程度。"""
-        super().__init__(type="system", origin="system")
+        super().__init__(
+            type="system",
+            uuid=uuid or new_id("msg"),
+            timestamp=time.time() if timestamp is None else timestamp,
+            origin="system",
+        )
         self.content = content
         self.subtype = subtype
         self.level = level
@@ -127,10 +172,92 @@ class ContextSummaryMessage(MessageBase):
     """
     summary: str = ""
 
-    def __init__(self, summary: str) -> None:
+    def __init__(
+        self,
+        summary: str,
+        *,
+        uuid: str | None = None,
+        timestamp: float | None = None,
+    ) -> None:
         """创建一条压缩摘要消息；它默认是 meta 消息，来源标记为 compact。"""
-        super().__init__(type="context_summary", is_meta=True, origin="compact")
+        super().__init__(
+            type="context_summary",
+            uuid=uuid or new_id("msg"),
+            timestamp=time.time() if timestamp is None else timestamp,
+            is_meta=True,
+            origin="compact",
+        )
         self.summary = summary
+
+
+@dataclass
+class CompactRecordMessage(MessageBase):
+    """持久化一次压缩操作，供后续 API Context 重放。"""
+
+    compact_type: CompactType = "snip"
+    covered_message_ids: list[str] = field(default_factory=list)
+    superseded_record_ids: list[str] = field(default_factory=list)
+    cleared_tool_use_ids: list[str] = field(default_factory=list)
+    summary: str | None = None
+    tokens_before: int = 0
+    tokens_after: int = 0
+    created_step: int = 0
+    created_turn: int = 0
+
+    def __init__(
+        self,
+        compact_type: CompactType,
+        *,
+        covered_message_ids: list[str] | None = None,
+        superseded_record_ids: list[str] | None = None,
+        cleared_tool_use_ids: list[str] | None = None,
+        summary: str | None = None,
+        tokens_before: int = 0,
+        tokens_after: int = 0,
+        created_step: int = 0,
+        created_turn: int = 0,
+        uuid: str | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        super().__init__(
+            type="compact_record",
+            uuid=uuid or new_id("compact"),
+            timestamp=time.time() if timestamp is None else timestamp,
+            is_meta=True,
+            origin="compact",
+        )
+        self.compact_type = compact_type
+        self.covered_message_ids = list(covered_message_ids or [])
+        self.superseded_record_ids = list(superseded_record_ids or [])
+        self.cleared_tool_use_ids = list(cleared_tool_use_ids or [])
+        self.summary = summary
+        self.tokens_before = tokens_before
+        self.tokens_after = tokens_after
+        self.created_step = created_step
+        self.created_turn = created_turn
+
+
+@dataclass
+class SystemPromptSnapshotMessage(MessageBase):
+    """保存会话创建时冻结的 system prompt。"""
+
+    prompt: str = ""
+
+    def __init__(
+        self,
+        prompt: str,
+        *,
+        uuid: str | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        super().__init__(
+            type="system_prompt_snapshot",
+            uuid=uuid or new_id("system_prompt"),
+            timestamp=time.time() if timestamp is None else timestamp,
+            is_meta=True,
+            origin="system",
+        )
+        self.prompt = prompt
 
 
 class ApiMessage(BaseModel):

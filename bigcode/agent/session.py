@@ -12,18 +12,39 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from bigcode.agent.events import EventSink, StatusEvent, TurnCompleted
+from bigcode.agent.events import EventSink, StatusEvent, StreamEvent, TurnCompleted
 from bigcode.agent.snapshot import SessionSnapshot, load_session_snapshot, save_session_snapshot
 from bigcode.config.models import ResolvedModel, RuntimeConfig
 from bigcode.context.builder import ContextBuildDeps, build_context_for_api
-from bigcode.context.messages import AssistantMessage, MessageBase, TextBlock, ToolUseBlock, UserMessage, text_from_blocks
+from bigcode.context.compact import CompactDeps, ContextCompactState, apply_context_compact
+from bigcode.context.messages import (
+    ApiMessage,
+    AssistantMessage,
+    CompactRecordMessage,
+    MessageBase,
+    SystemPromptSnapshotMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
+    UserMessage,
+    text_from_blocks,
+)
 from bigcode.context.normalizer import tool_run_result_to_message
+from bigcode.context.system_prompt import build_system_prompt
 from bigcode.context.transcript import Transcript
 from bigcode.hooks.builtins import register_builtin_hooks
 from bigcode.hooks.models import HookInput
 from bigcode.hooks import HookBus
 from bigcode.mcp import McpClientManager
-from bigcode.models import ClaudeCompatibleModelClient
+from bigcode.models import (
+    ClaudeCompatibleModelClient,
+    StreamEnd,
+    TextDelta,
+    ThinkingComplete,
+    ToolCallComplete,
+    ToolCallStart,
+    create_client,
+)
 from bigcode.plan import PlanModeState, PlanStore
 from bigcode.skills import load_skills
 from bigcode.subagents.definitions import AgentDefinition
@@ -33,6 +54,7 @@ from bigcode.tools.artifacts import ArtifactStore
 from bigcode.tools import ToolExecutionContext, ToolRegistry, ToolRunner, ToolUse, build_default_registry
 from bigcode.tools.permissions import ToolPermissionContext, PermissionRule
 from bigcode.tools.read_file_state import ReadFileState
+from bigcode.tui import BigCodeTUI
 from bigcode.utils.ids import new_id
 
 
@@ -65,6 +87,8 @@ class AgentSession:
         persist_snapshot: bool = True,
         load_transcript: bool = True,
         abort_event: threading.Event | None = None,
+        system_instruction: str | None = None,
+        is_main_thread: bool = True,
     ) -> None:
         """初始化会话状态。
 
@@ -72,6 +96,7 @@ class AgentSession:
         """
         self.config = config
         self.persist_snapshot = persist_snapshot
+        self.is_main_thread = is_main_thread
 
         # session_id 传进来通常表示“恢复旧会话”；能读到 snapshot 时优先复用旧状态，
         # 读不到时就按新会话处理。这样 resume 和新建会话走同一个初始化路径。
@@ -91,6 +116,10 @@ class AgentSession:
         self.registry = registry or build_default_registry()
         self.runner = ToolRunner(self.registry)
         self.messages: list[MessageBase] = []
+        self.compact_state = ContextCompactState(
+            turn_index=snapshot.compact_turn_index if snapshot else 0,
+            auto_compact_failures=snapshot.compact_auto_failures if snapshot else 0,
+        )
 
         # 下面这些字段是 resume 时最需要恢复的会话状态：
         # 文件快照保护编辑安全，技能/验证命令则影响后续上下文提醒。
@@ -107,6 +136,7 @@ class AgentSession:
         self.mcp_manager = McpClientManager(config.mcp_servers, enabled=config.mcp_enabled)
         self.non_interactive = non_interactive
         self.event_sink = event_sink
+        self.ui = BigCodeTUI(enabled=event_sink is None)
         self.hook_bus = HookBus()
         register_builtin_hooks(self.hook_bus)
 
@@ -116,6 +146,27 @@ class AgentSession:
         self.artifact_store = ArtifactStore(config.project_state_dir, self.session_id)
         if session_id and load_transcript:
             self.messages = self.transcript.load()
+        prompt_snapshot = next(
+            (message for message in self.messages if isinstance(message, SystemPromptSnapshotMessage)),
+            None,
+        )
+        if prompt_snapshot:
+            self.system_prompt = prompt_snapshot.prompt
+        elif snapshot and snapshot.system_prompt:
+            self.system_prompt = snapshot.system_prompt
+            prompt_snapshot = SystemPromptSnapshotMessage(self.system_prompt)
+            self.messages.append(prompt_snapshot)
+            self.transcript.append(prompt_snapshot)
+        else:
+            self.system_prompt = build_system_prompt(
+                cwd=self.config.cwd,
+                tool_names=[tool.name for tool in self.registry.list_tools()],
+                instruction_paths=self.config.instruction_paths,
+                role_instruction=system_instruction,
+            ).render()
+            prompt_snapshot = SystemPromptSnapshotMessage(self.system_prompt)
+            self.messages.append(prompt_snapshot)
+            self.transcript.append(prompt_snapshot)
 
     @property
     def model(self) -> ResolvedModel:
@@ -167,12 +218,13 @@ class AgentSession:
         await self.hook_bus.emit("SessionStart", HookInput("SessionStart", self.session_id, str(self.config.cwd), self.permission_context.mode))
         self._save_snapshot()
 
-    async def run_turn(self, prompt: str, *, max_steps: int = 20) -> AgentTurnResult:
+    async def run_turn(self, prompt: str, *, max_steps: int = 20, display_stream: bool = False) -> AgentTurnResult:
         """执行一次用户输入到模型回复的完整循环。
 
         一次 turn 可能包含多步：模型先回复工具调用，工具执行结果再回填给模型，直到模型输出最终文本或达到 max_steps。
         """
         self._emit_status("turn_started", max_steps=max_steps)
+        self.compact_state.turn_index += 1
         user_msg = UserMessage(prompt)
         self.messages.append(user_msg)
         self._append_transcript(user_msg)
@@ -184,6 +236,7 @@ class AgentSession:
         assistant_text = ""
         tool_results: list[Any] = []
         for step in range(max_steps):
+            self.compact_state.step_index = step
             self._emit_status("model_request_started", step=step)
 
             # 每一步请求模型前都重新构建上下文，因为上一轮工具结果、hook 附件、
@@ -201,15 +254,29 @@ class AgentSession:
                     task_store=self.task_store,
                     task_list_id=self.task_list_id,
                     capabilities=self._capabilities(),
+                    system_prompt=self.system_prompt,
+                    compact_config=self.config.compact,
+                    compact_state=self.compact_state,
+                    context_window=self.model.context_window or 128000,
+                    tool_schemas=self.registry.schemas_for_model(),
+                    summary_callback=self._summarize_context,
+                    is_main_thread=self.is_main_thread,
+                    protocol=self.model.protocol,
                 ),
             )
-            response = await ClaudeCompatibleModelClient(self.model).complete(
+            self._append_compact_records(built.compact_result.records_to_append)
+            if built.compact_result.blocked:
+                raise RuntimeError(
+                    "Context is too large after compaction "
+                    f"({built.compact_result.utilization_after:.1%} of the model context window)."
+                )
+            assistant = await self._request_model_stream(
                 built.system_prompt,
                 built.api_messages,
                 self.registry.schemas_for_model(),
+                display_stream=display_stream,
             )
             self._emit_status("model_response_completed", step=step)
-            assistant = response.message
             self.messages.append(assistant)
             self._append_transcript(assistant)
             text = text_from_blocks(assistant.content)
@@ -251,6 +318,49 @@ class AgentSession:
         self._emit_turn_completed(assistant_text, "max_steps", len(tool_results))
         return AgentTurnResult(assistant_text=assistant_text, tool_results=tool_results, stop_reason="max_steps")
 
+    async def _request_model_stream(
+        self,
+        system_prompt: str,
+        api_messages: list[Any],
+        tool_schemas: list[dict[str, Any]],
+        *,
+        display_stream: bool = False,
+    ) -> AssistantMessage:
+        """请求模型流并收集成一条 AssistantMessage。"""
+        text_parts: list[str] = []
+        thinking_blocks: list[ThinkingBlock] = []
+        tool_blocks: list[ToolUseBlock] = []
+        stop_reason: str | None = None
+        usage: dict[str, Any] = {}
+
+        client = _create_model_client(self.model)
+        async for event in client.stream(system_prompt, api_messages, tool_schemas):
+            if isinstance(event, TextDelta):
+                text_parts.append(event.text)
+                self._emit_stream(event.text)
+                if display_stream:
+                    self.ui.stream_text(event.text)
+            elif isinstance(event, ThinkingComplete):
+                thinking_blocks.append(ThinkingBlock(thinking=event.thinking, signature=event.signature))
+            elif isinstance(event, ToolCallStart):
+                if display_stream:
+                    self.ui.tool_call(event.name, event.id)
+            elif isinstance(event, ToolCallComplete):
+                tool_blocks.append(ToolUseBlock(id=event.id, name=event.name, input=event.input))
+            elif isinstance(event, StreamEnd):
+                stop_reason = event.stop_reason
+                usage = {"input_tokens": event.input_tokens, "output_tokens": event.output_tokens}
+
+        if display_stream and text_parts:
+            self.ui.print()
+
+        content = []
+        content.extend(thinking_blocks)
+        if text_parts:
+            content.append(TextBlock(text="".join(text_parts)))
+        content.extend(tool_blocks)
+        return AssistantMessage(content, model=self.model.ref, stop_reason=stop_reason, usage=usage)
+
     async def run_subagent(
         self,
         definition: AgentDefinition,
@@ -284,6 +394,8 @@ class AgentSession:
             persist_snapshot=False,
             load_transcript=False,
             abort_event=child_abort_event,
+            system_instruction=definition.system_prompt,
+            is_main_thread=False,
         )
         child.permission_context.mode = _resolve_subagent_permission_mode(self.permission_context.mode, definition)
         child.task_list_id = self.task_list_id
@@ -308,7 +420,7 @@ class AgentSession:
         stop_reason = None
         error: str | None = None
         try:
-            result = await child.run_turn(f"{definition.system_prompt}\n\nTask:\n{prompt}", max_steps=definition.max_turns)
+            result = await child.run_turn(prompt, max_steps=definition.max_turns)
             result_summary = result.assistant_text
             stop_reason = result.stop_reason
             run_result = AgentRunResult(
@@ -465,15 +577,15 @@ class AgentSession:
         TTY 模式会不断 input；管道模式会逐行读取 stdin，支持普通提问和 / 开头的本地命令。
         """
         await self.start()
-        print(f"BigCode session {self.session_id}")
+        self.ui.header(self.session_id, self.model_ref)
         if self.config.config_errors:
             # 配置加载阶段收集到的 warning 在启动时先打印出来，
             # 但不阻止用户继续进入 REPL。
-            print("Config warnings:")
+            self.ui.warning("Config warnings:")
             for err in self.config.config_errors:
-                print(f"  - {err}")
+                self.ui.print(f"  - {err}")
         if not self.model_ref:
-            print("No model configured. Add .bigcode/models.json with default_model before asking model-backed questions.")
+            self.ui.warning("No model configured. Add .bigcode/models.json with default_model before asking model-backed questions.")
         if not sys.stdin.isatty():
             # 非 TTY 通常来自管道，例如 echo "..." | bigcode。
             # 这种模式不能持续交互，只能逐行处理 stdin。
@@ -489,17 +601,17 @@ class AgentSession:
                 try:
                     result = await self.run_turn(line)
                 except Exception as exc:
-                    print(f"Error: {_format_exception(exc)}")
+                    self.ui.error(_format_exception(exc))
                     continue
                 if result.assistant_text:
-                    print(result.assistant_text)
+                    self.ui.print(result.assistant_text)
             return
         while True:
             try:
                 # input() 是阻塞函数；放进 asyncio.to_thread 可以避免堵住事件循环。
                 line = await asyncio.to_thread(input, "\nbigcode> ")
             except (EOFError, KeyboardInterrupt):
-                print()
+                self.ui.print()
                 break
             line = line.strip()
             if not line:
@@ -510,12 +622,10 @@ class AgentSession:
                     break
                 continue
             try:
-                result = await self.run_turn(line)
+                result = await self.run_turn(line, display_stream=True)
             except Exception as exc:
-                print(f"Error: {_format_exception(exc)}")
+                self.ui.error(_format_exception(exc))
                 continue
-            if result.assistant_text:
-                print(result.assistant_text)
 
     async def handle_command(self, line: str) -> bool:
         """处理 /help、/doctor、/status、/plan、/compact 等本地命令。
@@ -527,7 +637,7 @@ class AgentSession:
             # 返回 True 表示 REPL 外层循环应该退出。
             return True
         if cmd == "/help":
-            print("Commands: /help, /exit, /status, /doctor, /plan, /compact")
+            self.ui.print("Commands: /help, /exit, /status, /doctor, /plan, /compact")
             return False
         if cmd == "/doctor":
             from bigcode.diagnostics import build_doctor_report, render_doctor_report
@@ -546,29 +656,32 @@ class AgentSession:
                 skill_registry=self.skill_registry,
                 mcp_manager=self.mcp_manager,
             )
-            print(render_doctor_report(report), end="")
+            self.ui.print(render_doctor_report(report), end="")
             return False
         if cmd == "/status":
             # /status 只读当前内存状态，适合排查“当前会话到底记住了什么”。
-            print(f"session: {self.session_id}")
-            print(f"cwd: {self.config.cwd}")
-            print(f"model: {self.model_ref}")
-            print(f"permission mode: {self.permission_context.mode}")
-            print(f"sandbox profile: {self.config.sandbox_profile}")
-            print(f"messages: {len(self.messages)}")
-            print(f"loaded skills: {', '.join(sorted(self.loaded_skills)) if self.loaded_skills else '(none)'}")
+            rows: dict[str, Any] = {
+                "session": self.session_id,
+                "cwd": self.config.cwd,
+                "model": self.model_ref,
+                "protocol": self._model_protocol_label(),
+                "permission mode": self.permission_context.mode,
+                "sandbox profile": self.config.sandbox_profile,
+                "messages": len(self.messages),
+                "loaded skills": ", ".join(sorted(self.loaded_skills)) if self.loaded_skills else "(none)",
+            }
             if self.last_verification:
-                print(f"last verification: {self.last_verification.get('command')} (exit {self.last_verification.get('exit_code')})")
+                rows["last verification"] = f"{self.last_verification.get('command')} (exit {self.last_verification.get('exit_code')})"
             counts = self.agent_task_store.status_counts()
             total_background = sum(counts.values())
-            print(
-                "background subagents: "
+            rows["background subagents"] = (
                 f"{total_background} "
                 f"(queued {counts.get('queued', 0)}, running {counts.get('running', 0)}, "
                 f"completed {counts.get('completed', 0)}, failed {counts.get('failed', 0)}, "
                 f"cancelled {counts.get('cancelled', 0)})"
             )
-            print(f"fastmcp available: {self.mcp_manager.fastmcp_available}")
+            rows["fastmcp available"] = self.mcp_manager.fastmcp_available
+            self.ui.status_table(rows)
             return False
         if cmd == "/plan":
             if not self.plan_state.active:
@@ -577,24 +690,37 @@ class AgentSession:
 
                 # 本地命令直接调用工具类，复用工具内部对 PlanModeState 的更新逻辑。
                 await EnterPlanModeTool().call(EmptyInput(), self.make_tool_context())
-                print(f"Entered Plan Mode: {self.plan_state.plan_file}")
+                self.ui.print(f"Entered Plan Mode: {self.plan_state.plan_file}")
             else:
                 # 已经在 Plan Mode 时，/plan 只展示当前计划文件，不会退出计划模式。
                 content = self.plan_store.read(self.session_id) or ""
-                print(f"Plan file: {self.plan_state.plan_file}")
-                print(content or "(empty)")
+                self.ui.print(f"Plan file: {self.plan_state.plan_file}")
+                self.ui.print(content or "(empty)")
             return False
         if cmd == "/compact":
-            from bigcode.context.compact import apply_context_compact
-
-            # 手动压缩只改变当前内存里的 messages；之后 append transcript 时会继续记录新消息。
-            compacted = await apply_context_compact(self.messages, max_messages=40)
-            self.messages = compacted.projected_messages
+            compacted = await apply_context_compact(
+                self.messages,
+                CompactDeps(
+                    config=self.config.compact,
+                    state=self.compact_state,
+                    context_window=self.model.context_window or 128000,
+                    system_prompt=self.system_prompt,
+                    tool_schemas=self.registry.schemas_for_model(),
+                    is_main_thread=self.is_main_thread,
+                    summarize=self._summarize_context,
+                ),
+                force_auto=True,
+            )
+            self._append_compact_records(compacted.records_to_append)
             self.read_file_state.clear()
             self._save_snapshot()
-            print(f"Compacted messages: {len(self.messages)}")
+            self.ui.print(
+                "Compacted context: "
+                f"{compacted.tokens_before} -> {compacted.tokens_after} tokens "
+                f"({compacted.utilization_after:.1%})"
+            )
             return False
-        print(f"Unknown command: {cmd}")
+        self.ui.print(f"Unknown command: {cmd}")
         return False
 
     async def _emit_subagent_hook(
@@ -664,12 +790,30 @@ class AgentSession:
                 caps.append("MCP configured but FastMCP is not installed; MCP calls will report dependency_missing")
         return caps
 
+    def _model_protocol_label(self) -> str:
+        """返回当前模型协议；配置错误时返回占位文本。"""
+        if not self.model_ref:
+            return "(none)"
+        try:
+            return self.model.protocol
+        except Exception:
+            return "(invalid)"
+
     def _emit_status(self, status: str, **metadata: Any) -> None:
         """向 event_sink 发送普通状态事件；没有 event_sink 时直接忽略。"""
         if not self.event_sink:
             return
         try:
             self.event_sink(StatusEvent(session_id=self.session_id, status=status, metadata=metadata))
+        except Exception:
+            return
+
+    def _emit_stream(self, text: str) -> None:
+        """向 event_sink 发送模型文本增量。"""
+        if not self.event_sink or not text:
+            return
+        try:
+            self.event_sink(StreamEvent(session_id=self.session_id, text=text))
         except Exception:
             return
 
@@ -709,6 +853,36 @@ class AgentSession:
         self.transcript.append(message)
         self._save_snapshot()
 
+    def _append_compact_records(self, records: list[CompactRecordMessage]) -> None:
+        """把本轮新生成的压缩事件追加到 UI Context 和 transcript。"""
+        for record in records:
+            self.messages.append(record)
+            self.transcript.append(record)
+        if records:
+            self._save_snapshot()
+
+    async def _summarize_context(self, compact_type: str, content: str) -> str:
+        """用独立模型请求生成 Collapse/Auto Compact 摘要。"""
+        if compact_type == "collapse":
+            instruction = (
+                "Create a concise context-collapse summary. Preserve user intent, active goals, "
+                "tool calls and results that still matter, file paths and edits, exact relevant "
+                "errors, decisions, current state, and pending work."
+            )
+        else:
+            instruction = (
+                "Create a structured conversation summary with sections for Primary Request, "
+                "Key Decisions, Files Read or Modified, Errors Encountered, Current State, and "
+                "Pending Tasks. Preserve exact paths and important error text."
+            )
+        messages: list[Any]
+        if self.model.protocol == "openai":
+            messages = [{"role": "user", "content": content}]
+        else:
+            messages = [ApiMessage(role="user", content=[{"type": "text", "text": content}])]
+        assistant = await self._request_model_stream(instruction, messages, [], display_stream=False)
+        return text_from_blocks(assistant.content)
+
     def _save_snapshot(self) -> None:
         """把可恢复会话需要的状态写入 sessions/<id>.json。"""
         if not self.persist_snapshot:
@@ -727,6 +901,9 @@ class AgentSession:
                 read_file_snapshots=self.read_file_state.to_snapshot(),
                 loaded_skills=sorted(self.loaded_skills),
                 last_verification=self.last_verification,
+                system_prompt=self.system_prompt,
+                compact_auto_failures=self.compact_state.auto_compact_failures,
+                compact_turn_index=self.compact_state.turn_index,
             ),
         )
 
@@ -740,6 +917,42 @@ def _clone_permission_context(ctx: ToolPermissionContext) -> ToolPermissionConte
         always_ask=[PermissionRule(**rule.__dict__) for rule in ctx.always_ask],
         should_avoid_permission_prompts=ctx.should_avoid_permission_prompts,
     )
+
+
+def _create_model_client(model: ResolvedModel) -> Any:
+    """创建模型客户端；测试替换旧 complete 客户端时自动适配成流式接口。"""
+    if getattr(ClaudeCompatibleModelClient, "__module__", "") != "bigcode.models.claude_compatible":
+        return _CompleteClientAdapter(ClaudeCompatibleModelClient(model))
+    return create_client(model)
+
+
+class _CompleteClientAdapter:
+    """把旧 complete() 客户端适配成 stream()，用于保留旧测试和扩展兼容性。"""
+
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    async def stream(
+        self,
+        system_prompt: str,
+        messages: list[Any],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        response = await self.client.complete(system_prompt, messages, tools or [])
+        usage = response.message.usage or {}
+        for block in response.message.content:
+            if isinstance(block, TextBlock):
+                yield TextDelta(text=block.text)
+            elif isinstance(block, ThinkingBlock):
+                yield ThinkingComplete(thinking=block.thinking, signature=block.signature)
+            elif isinstance(block, ToolUseBlock):
+                yield ToolCallStart(id=block.id, name=block.name)
+                yield ToolCallComplete(id=block.id, name=block.name, input=block.input)
+        yield StreamEnd(
+            stop_reason=response.message.stop_reason,
+            input_tokens=usage.get("input_tokens", 0) if isinstance(usage.get("input_tokens"), int) else 0,
+            output_tokens=usage.get("output_tokens", 0) if isinstance(usage.get("output_tokens"), int) else 0,
+        )
 
 
 def _dedupe_paths(paths: list[Path]) -> list[Path]:

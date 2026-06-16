@@ -1,0 +1,47 @@
+defaults:
+  model: openai-main
+  timeout: 120
+  max_retries: 3
+
+providers:
+  openai-local:
+    protocol: openai
+    base_url: https://api.example.com/v1
+    api_key_env: OPENAI_API_KEY
+
+  anthropic-local:
+    protocol: anthropic
+    base_url: https://api.example.com
+    api_key_env: ANTHROPIC_API_KEY
+    anthropic_version: "2023-06-01"
+
+models:
+  openai-main:
+    provider: openai-local
+    model: gpt-5.1
+    max_tokens: 8192
+    temperature: 0.2
+
+  openai-fast:
+    provider: openai-local
+    model: gpt-4.1-mini
+    max_tokens: 4096
+    temperature: 0.2
+
+  qwen-coder:
+    provider: openai-local
+    model: qwen3-coder
+    max_tokens: 16384
+    temperature: 0.1
+
+  claude-main:
+    provider: anthropic-local
+    model: claude-sonnet-4-5
+    max_tokens: 8192
+    temperature: 0.2
+
+  claude-fast:
+    provider: anthropic-local
+    model: claude-haiku-4-5
+    max_tokens: 4096
+    temperature: 0.2

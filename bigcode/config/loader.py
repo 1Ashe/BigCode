@@ -13,7 +13,7 @@ from bigcode.tools.permissions import PermissionRule, ToolPermissionContext, par
 from bigcode.utils.ids import project_id_for_path
 from bigcode.utils.jsonio import deep_merge, read_json_file
 
-from .models import McpServerConfig, ModelCapabilities, ResolvedModel, RuntimeConfig
+from .models import CompactConfig, McpServerConfig, ModelCapabilities, ResolvedModel, RuntimeConfig
 
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -71,6 +71,7 @@ def load_runtime_config(
     permission_context = _parse_permissions(settings.get("permissions") or {}, errors)
     workspace_roots = _resolve_workspace_roots(cwd_path, settings.get("workspace_roots") or [], errors)
     sandbox_profile = _parse_sandbox_profile(settings.get("sandbox") or {}, errors)
+    compact_config = _parse_compact_config(settings.get("compact") or {}, errors)
 
     models, model_errors = _parse_models(models_json)
     errors.extend(model_errors)
@@ -79,9 +80,12 @@ def load_runtime_config(
         or env.get("BIGCODE_MODEL")
         or settings.get("default_model")
         or models_json.get("default_model")
+        or (models_json.get("defaults") or {}).get("model")
     )
     if default_model_ref and default_model_ref not in models:
         errors.append(f"default model {default_model_ref!r} is not present in models registry")
+    elif default_model_ref and models[default_model_ref].context_window is None:
+        errors.append(f"default model {default_model_ref!r} has no context_window; compact will use 128000")
 
     # MCP 的 enabled 开关放在 bigcode.mcp 下；具体 server 列表仍按 mcpServers 解析。
     mcp_settings = deep_merge(settings.get("bigcode", {}).get("mcp", {}) or {}, mcp_json.get("bigcode", {}).get("mcp", {}) or {})
@@ -131,6 +135,7 @@ def load_runtime_config(
         agent_roots=agent_roots,
         instruction_paths=instruction_paths,
         plan_default_dir=plan_dir,
+        compact=compact_config,
         task_default_list_id=task_default,
         sandbox_profile=sandbox_profile,
         config_errors=errors,
@@ -239,6 +244,84 @@ def _parse_sandbox_profile(data: dict[str, Any], errors: list[str]) -> str:
     return profile
 
 
+def _parse_compact_config(data: dict[str, Any], errors: list[str]) -> CompactConfig:
+    """解析 compact 设置；单项非法时回退该字段默认值。"""
+    defaults = CompactConfig()
+    if not isinstance(data, dict):
+        errors.append("compact settings must be an object; using defaults")
+        return defaults
+
+    def boolean(name: str) -> bool:
+        value = data.get(name, getattr(defaults, name))
+        if isinstance(value, bool):
+            return value
+        errors.append(f"compact.{name} must be a boolean; using default")
+        return getattr(defaults, name)
+
+    def positive_int(name: str) -> int:
+        value = data.get(name, getattr(defaults, name))
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        errors.append(f"compact.{name} must be a positive integer; using default")
+        return getattr(defaults, name)
+
+    def ratio(name: str) -> float:
+        value = data.get(name, getattr(defaults, name))
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < float(value) < 1:
+            return float(value)
+        errors.append(f"compact.{name} must be between 0 and 1; using default")
+        return getattr(defaults, name)
+
+    config = CompactConfig(
+        time_microcompact_enabled=boolean("time_microcompact_enabled"),
+        time_microcompact_gap_minutes=positive_int("time_microcompact_gap_minutes"),
+        time_microcompact_keep_recent=positive_int("time_microcompact_keep_recent"),
+        snip_enabled=boolean("snip_enabled"),
+        snip_threshold=ratio("snip_threshold"),
+        snip_target=ratio("snip_target"),
+        snip_min_messages=positive_int("snip_min_messages"),
+        snip_min_tokens=positive_int("snip_min_tokens"),
+        context_collapse_enabled=boolean("context_collapse_enabled"),
+        collapse_threshold=ratio("collapse_threshold"),
+        collapse_target=ratio("collapse_target"),
+        collapse_min_tokens_saved=positive_int("collapse_min_tokens_saved"),
+        collapse_max_spans_per_pass=positive_int("collapse_max_spans_per_pass"),
+        auto_compact_enabled=boolean("auto_compact_enabled"),
+        auto_compact_threshold=ratio("auto_compact_threshold"),
+        auto_keep_tokens=positive_int("auto_keep_tokens"),
+        auto_min_keep_messages=positive_int("auto_min_keep_messages"),
+        auto_max_failures=positive_int("auto_max_failures"),
+        blocked_threshold=ratio("blocked_threshold"),
+        protected_tail_messages=positive_int("protected_tail_messages"),
+        protected_tail_tokens=positive_int("protected_tail_tokens"),
+    )
+    if config.snip_target >= config.snip_threshold:
+        errors.append("compact.snip_target must be lower than snip_threshold; using defaults")
+        config = CompactConfig(**{**config.__dict__, "snip_target": defaults.snip_target, "snip_threshold": defaults.snip_threshold})
+    if config.collapse_target >= config.collapse_threshold:
+        errors.append("compact.collapse_target must be lower than collapse_threshold; using defaults")
+        config = CompactConfig(
+            **{
+                **config.__dict__,
+                "collapse_target": defaults.collapse_target,
+                "collapse_threshold": defaults.collapse_threshold,
+            }
+        )
+    highest_trigger = max(config.snip_threshold, config.collapse_threshold, config.auto_compact_threshold)
+    if config.blocked_threshold <= highest_trigger:
+        errors.append("compact.blocked_threshold must exceed all compact thresholds; using default thresholds")
+        config = CompactConfig(
+            **{
+                **config.__dict__,
+                "snip_threshold": defaults.snip_threshold,
+                "collapse_threshold": defaults.collapse_threshold,
+                "auto_compact_threshold": defaults.auto_compact_threshold,
+                "blocked_threshold": defaults.blocked_threshold,
+            }
+        )
+    return config
+
+
 def _behavior_for_key(key: str) -> str:
     """根据配置键名 always_allow/always_deny/always_ask 推断行为。"""
     if key.endswith("allow"):
@@ -249,70 +332,137 @@ def _behavior_for_key(key: str) -> str:
 
 
 def _parse_models(data: dict[str, Any]) -> tuple[dict[str, ResolvedModel], list[str]]:
-    """解析 models.json 的 providers/models，生成 provider:model_key 形式的 ResolvedModel 表。"""
+    """解析模型配置，兼容旧嵌套格式和新 provider/model 分离格式。"""
     errors: list[str] = []
     out: dict[str, ResolvedModel] = {}
     providers = data.get("providers") or {}
     if not isinstance(providers, dict):
         return out, ["models.json providers must be an object"]
-    for provider_name, provider in providers.items():
-        if not _NAME_RE.match(str(provider_name)):
-            errors.append(f"invalid provider name {provider_name!r}")
-            continue
-        if not isinstance(provider, dict):
-            errors.append(f"provider {provider_name!r} must be an object")
-            continue
 
-        # provider 是服务商级配置：base_url、鉴权 header、api_key_env 等。
-        # models 是该服务商下面的具体模型列表。
-        provider_type = provider.get("type", "claude-compatible")
-        if provider_type == "openai-compatible":
-            errors.append(f"provider {provider_name!r}: type 'openai-compatible' is deprecated; treating as 'claude-compatible'")
-            provider_type = "claude-compatible"
-        if provider_type != "claude-compatible":
-            errors.append(f"provider {provider_name!r}: unsupported type {provider_type!r}")
+    provider_infos: dict[str, dict[str, Any]] = {}
+    for provider_name, provider in providers.items():
+        info = _parse_provider_info(str(provider_name), provider, errors)
+        if info is not None:
+            provider_infos[str(provider_name)] = info
+
+    # 旧格式：providers.<name>.models.<key>。
+    for provider_name, info in provider_infos.items():
+        models = info["raw"].get("models") or {}
+        if not models:
             continue
-        base_url = provider.get("base_url")
-        if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
-            errors.append(f"provider {provider_name!r}: invalid base_url")
-            continue
-        models = provider.get("models") or {}
         if not isinstance(models, dict):
             errors.append(f"provider {provider_name!r}: models must be an object")
             continue
         for model_key, model in models.items():
-            # model_key 是 BigCode 配置里的短名。最终模型引用会变成
-            # provider:model_key，例如 "anthropic:sonnet"。
             if not _MODEL_KEY_RE.match(str(model_key)):
                 errors.append(f"provider {provider_name!r}: invalid model key {model_key!r}")
                 continue
             if not isinstance(model, dict):
                 errors.append(f"provider {provider_name!r}: model {model_key!r} must be an object")
                 continue
-            api_key_env = _parse_api_key_env(provider_name=str(provider_name), raw=provider.get("api_key_env"), errors=errors)
             ref = f"{provider_name}:{model_key}"
-            caps = model.get("capabilities") or {}
+            out[ref] = _resolved_model_from_parts(ref, provider_name, str(model_key), model, info)
 
-            # ResolvedModel 是“已经拍平”的最终配置，后续请求模型时不再回头查原始 JSON。
-            out[ref] = ResolvedModel(
-                ref=ref,
-                provider=str(provider_name),
-                model_key=str(model_key),
-                model_id=str(model.get("id") or model_key),
-                base_url=base_url.rstrip("/"),
-                api_key_env=api_key_env,
-                default_headers=dict(provider.get("default_headers") or {}),
-                capabilities=ModelCapabilities(
-                    supports_images=bool(caps.get("supports_images", False)),
-                    supports_tools=bool(caps.get("supports_tools", True)),
-                    supports_parallel_tool_calls=bool(caps.get("supports_parallel_tool_calls", False)),
-                    supports_thinking=bool(caps.get("supports_thinking", False)),
-                ),
-                context_window=model.get("context_window"),
-                max_output_tokens=model.get("max_output_tokens"),
-                provider_type=provider_type,
-            )
+    # 新格式：models.<ref>.provider 指向 providers.<name>。
+    top_models = data.get("models") or {}
+    if top_models:
+        if not isinstance(top_models, dict):
+            errors.append("models.json models must be an object")
+        else:
+            for model_ref, model in top_models.items():
+                if not _MODEL_KEY_RE.match(str(model_ref)):
+                    errors.append(f"invalid model ref {model_ref!r}")
+                    continue
+                if not isinstance(model, dict):
+                    errors.append(f"model {model_ref!r} must be an object")
+                    continue
+                provider_name = str(model.get("provider") or "")
+                if not provider_name:
+                    errors.append(f"model {model_ref!r}: provider is required")
+                    continue
+                info = provider_infos.get(provider_name)
+                if info is None:
+                    errors.append(f"model {model_ref!r}: provider {provider_name!r} is not configured")
+                    continue
+                out[str(model_ref)] = _resolved_model_from_parts(str(model_ref), provider_name, str(model_ref), model, info)
     return out, errors
+
+
+def _parse_provider_info(provider_name: str, provider: Any, errors: list[str]) -> dict[str, Any] | None:
+    """解析 provider 级配置。"""
+    if not _NAME_RE.match(provider_name):
+        errors.append(f"invalid provider name {provider_name!r}")
+        return None
+    if not isinstance(provider, dict):
+        errors.append(f"provider {provider_name!r} must be an object")
+        return None
+
+    protocol = provider.get("protocol")
+    provider_type = provider.get("type", "claude-compatible")
+    if protocol is None:
+        if provider_type == "openai-compatible":
+            errors.append(f"provider {provider_name!r}: type 'openai-compatible' is deprecated; treating as anthropic protocol")
+            provider_type = "claude-compatible"
+        if provider_type != "claude-compatible":
+            errors.append(f"provider {provider_name!r}: unsupported type {provider_type!r}")
+            return None
+        protocol = "anthropic"
+    if protocol not in {"anthropic", "openai"}:
+        errors.append(f"provider {provider_name!r}: unsupported protocol {protocol!r}")
+        return None
+
+    base_url = provider.get("base_url")
+    if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
+        errors.append(f"provider {provider_name!r}: invalid base_url")
+        return None
+
+    headers = dict(provider.get("default_headers") or {})
+    anthropic_version = provider.get("anthropic_version")
+    if anthropic_version and "anthropic-version" not in {key.lower() for key in headers}:
+        headers["anthropic-version"] = str(anthropic_version)
+
+    return {
+        "raw": provider,
+        "protocol": str(protocol),
+        "provider_type": str(provider_type if protocol == "anthropic" else protocol),
+        "base_url": base_url.rstrip("/"),
+        "api_key_env": _parse_api_key_env(provider_name=provider_name, raw=provider.get("api_key_env"), errors=errors),
+        "default_headers": headers,
+    }
+
+
+def _resolved_model_from_parts(
+    ref: str,
+    provider_name: str,
+    model_key: str,
+    model: dict[str, Any],
+    provider_info: dict[str, Any],
+) -> ResolvedModel:
+    """把 provider 和 model 两层配置拍平成运行时模型配置。"""
+    caps = model.get("capabilities") or {}
+    model_id = str(model.get("id") or model.get("model") or model_key)
+    max_output_tokens = model.get("max_output_tokens", model.get("max_tokens"))
+    return ResolvedModel(
+        ref=ref,
+        provider=provider_name,
+        model_key=model_key,
+        model_id=model_id,
+        base_url=provider_info["base_url"],
+        api_key_env=provider_info["api_key_env"],
+        protocol=provider_info["protocol"],
+        default_headers=dict(provider_info["default_headers"]),
+        capabilities=ModelCapabilities(
+            supports_images=bool(caps.get("supports_images", False)),
+            supports_tools=bool(caps.get("supports_tools", True)),
+            supports_parallel_tool_calls=bool(caps.get("supports_parallel_tool_calls", False)),
+            supports_thinking=bool(caps.get("supports_thinking", False)),
+        ),
+        context_window=model.get("context_window"),
+        max_output_tokens=max_output_tokens if isinstance(max_output_tokens, int) else None,
+        temperature=_float_or_none(model.get("temperature")),
+        thinking=bool(model.get("thinking", False)),
+        provider_type=provider_info["provider_type"],
+    )
 
 
 def _parse_api_key_env(*, provider_name: str, raw: Any, errors: list[str]) -> str | None:
@@ -340,6 +490,15 @@ def _looks_like_secret(value: str) -> bool:
     if lowered.startswith(("sk-", "tp-", "ak-", "pk-")):
         return True
     return len(value) >= 24 and any(ch.isdigit() for ch in value) and any(ch.isalpha() for ch in value)
+
+
+def _float_or_none(value: Any) -> float | None:
+    """把配置里的数字转成 float，非法值按未配置处理。"""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
 
 
 def _parse_mcp_servers(data: dict[str, Any], errors: list[str]) -> dict[str, McpServerConfig]:

@@ -67,7 +67,8 @@ class SessionResumeTests(unittest.TestCase):
             self.assertTrue((config.project_state_dir / "transcripts" / "sess_a.jsonl").exists())
             snapshot = load_session_snapshot(config.project_state_dir, "sess_a")
             self.assertIsNotNone(snapshot)
-            self.assertEqual(snapshot.message_count, 2)
+            self.assertEqual(snapshot.message_count, 3)
+            self.assertTrue(snapshot.system_prompt)
             self.assertEqual(snapshot.model, "local:test")
 
     def test_resume_loads_transcript_and_model_override_wins(self) -> None:
@@ -88,7 +89,7 @@ class SessionResumeTests(unittest.TestCase):
                 asyncio.run(session.run_turn("hello"))
 
             resumed = AgentSession(config, session_id="sess_b", model_ref="local:test", non_interactive=True)
-            self.assertEqual(len(resumed.messages), 2)
+            self.assertEqual(len(resumed.messages), 3)
             self.assertEqual(resumed.model_ref, "local:test")
 
     def test_read_file_state_snapshot_blocks_duplicate_until_disk_changes(self) -> None:

@@ -1,7 +1,4 @@
-"""组装模型每次请求都会看到的 system prompt。
-
-学习思路：静态规则写死在代码里，动态信息来自当前 cwd、日期、工具列表、Plan Mode 和项目说明文件。
-"""
+"""在会话创建时生成一次固定的 system prompt。"""
 from __future__ import annotations
 
 import datetime as dt
@@ -33,26 +30,23 @@ def build_system_prompt(
     cwd: Path,
     tool_names: list[str],
     instruction_paths: list[Path],
-    plan_active: bool,
-    plan_file: str | None,
+    role_instruction: str | None = None,
 ) -> SystemPromptParts:
-    """根据当前运行环境、工具列表和项目说明文件构建 system prompt。"""
+    """生成会话级 prompt；调用方负责持久化并永久复用结果。"""
     # static 是无论何时都给模型看的固定行为准则。
     static = (
         "You are BigCode, a pragmatic coding agent. Use tools when they help. "
         "Do not invent file contents; inspect the workspace. Respect permissions and user instructions."
     )
-    # dynamic_lines 是本次运行环境，可能随着 cwd、工具列表、日期变化。
+    # 这些值只在会话创建时读取，之后即使环境变化也不重建。
     dynamic_lines = [
         f"Current date: {dt.date.today().isoformat()}",
         f"Platform: {platform.platform()}",
         f"cwd: {cwd}",
         "Available tools: " + ", ".join(sorted(tool_names)),
     ]
-    if plan_active:
-        dynamic_lines.append(
-            f"You are in Plan Mode. Read and inspect as needed, but do not edit workspace files or run mutating commands. Write the final implementation plan to {plan_file} and exit only with AskUserQuestion or ExitPlanMode."
-        )
+    if role_instruction:
+        dynamic_lines.append("Session role:\n" + role_instruction.strip())
     instructions = _read_instructions(instruction_paths)
     return SystemPromptParts(static=static, dynamic="\n".join(dynamic_lines), instructions=instructions)
 
