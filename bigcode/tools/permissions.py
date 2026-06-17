@@ -114,6 +114,7 @@ PLAN_ALLOWED_TOOLS = {
     "TaskOutput",
     "SkillLoad",
     "SkillResourceRead",
+    "Tool_Search",
     "ExternalResourceList",
     "ExternalResourceRead",
     "ExternalPromptList",
@@ -129,6 +130,7 @@ READ_ONLY_SANDBOX_TOOLS = {
     "TaskOutput",
     "SkillLoad",
     "SkillResourceRead",
+    "Tool_Search",
     "ExternalResourceList",
     "ExternalResourceRead",
     "ExternalPromptList",
@@ -172,7 +174,7 @@ async def decide_permission(
     if _is_unrelaxable(decision):
         return decision
 
-    sandbox_decision = _check_sandbox_profile(target, ctx)
+    sandbox_decision = _check_sandbox_profile(target, ctx, tool)
     if sandbox_decision:
         return sandbox_decision
 
@@ -242,14 +244,12 @@ def check_content_policy(target: PermissionTarget, ctx: ToolExecutionContext) ->
     return None
 
 
-def check_mode_policy_for_target(target: PermissionTarget, ctx: ToolExecutionContext) -> PermissionDecision | None:
+def check_mode_policy_for_target(target: PermissionTarget, ctx: ToolExecutionContext, tool: BaseTool | None = None) -> PermissionDecision | None:
     """工具返回精确 allow 前可调用的模式/状态收紧检查。"""
 
     if ctx.permission_context.mode == "plan":
         if target.tool_name not in PLAN_ALLOWED_TOOLS:
-            if target.tool_name == "Bash" and target.command and classify_bash(target.command) == "read":
-                return None
-            if target.tool_name == "Agent" and getattr(target.raw, "subagent_type", "") in {"explorer", "planAgent"}:
+            if _read_only_allowed_in_restricted_mode(tool, target, ctx):
                 return None
             return PermissionDecision(
                 "deny",
@@ -258,7 +258,7 @@ def check_mode_policy_for_target(target: PermissionTarget, ctx: ToolExecutionCon
                 updated_input=target.raw,
                 decision_reason={"type": "mode"},
             )
-    return _check_sandbox_profile_target(target, ctx)
+    return _check_sandbox_profile_target(target, ctx, tool)
 
 
 def check_safety_for_target(target: PermissionTarget, ctx: ToolExecutionContext) -> PermissionDecision | None:
@@ -378,10 +378,8 @@ def _apply_generic_defaults(
     mode = ctx.permission_context.mode
     if mode == "plan":
         if tool.name not in PLAN_ALLOWED_TOOLS:
-            if tool.name == "Bash" and target.command and classify_bash(target.command) == "read":
-                return PermissionDecision("allow", message="Read-only Bash allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
-            if tool.name == "Agent" and getattr(target.raw, "subagent_type", "") in {"explorer", "planAgent"}:
-                return PermissionDecision("allow", message="Read-only planning subAgent allowed.", updated_input=target.raw, decision_reason={"type": "mode"})
+            if _read_only_allowed_in_restricted_mode(tool, target, ctx):
+                return PermissionDecision("allow", message="Read-only tool allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
             return PermissionDecision("deny", message=f"{tool.name} is not allowed in Plan Mode.", reason="plan-mode", updated_input=target.raw, decision_reason={"type": "mode"})
         if decision.behavior == "passthrough":
             return PermissionDecision("allow", message="Allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
@@ -410,13 +408,13 @@ def _apply_generic_defaults(
     return PermissionDecision("deny", message=f"Unknown permission category {target.category!r}.", updated_input=target.raw)
 
 
-def _check_sandbox_profile(target: PermissionTarget, ctx: ToolExecutionContext) -> PermissionDecision | None:
+def _check_sandbox_profile(target: PermissionTarget, ctx: ToolExecutionContext, tool: BaseTool | None = None) -> PermissionDecision | None:
     """按 sandbox profile 收紧普通权限结果，不能被 bypass 或 allow 放宽。"""
 
-    return _check_sandbox_profile_target(target, ctx)
+    return _check_sandbox_profile_target(target, ctx, tool)
 
 
-def _check_sandbox_profile_target(target: PermissionTarget, ctx: ToolExecutionContext) -> PermissionDecision | None:
+def _check_sandbox_profile_target(target: PermissionTarget, ctx: ToolExecutionContext, tool: BaseTool | None = None) -> PermissionDecision | None:
     """按 sandbox profile 收紧普通权限结果，不能被 bypass 或 allow 放宽。"""
 
     profile = getattr(ctx, "sandbox_profile", "none")
@@ -426,9 +424,7 @@ def _check_sandbox_profile_target(target: PermissionTarget, ctx: ToolExecutionCo
     if profile == "read-only":
         if target.tool_name in READ_ONLY_SANDBOX_TOOLS:
             return None
-        if target.tool_name == "Bash" and kind == "read":
-            return None
-        if target.tool_name == "Agent" and getattr(target.raw, "subagent_type", "") in {"explorer", "planAgent"}:
+        if _read_only_allowed_in_restricted_mode(tool, target, ctx):
             return None
         return PermissionDecision(
             "deny",
@@ -455,6 +451,27 @@ def _check_sandbox_profile_target(target: PermissionTarget, ctx: ToolExecutionCo
                 decision_reason={"type": "safetyCheck"},
             )
     return None
+
+
+def _read_only_allowed_in_restricted_mode(tool: BaseTool | None, target: PermissionTarget, ctx: ToolExecutionContext) -> bool:
+    """Plan/read-only sandbox 中使用 ReadOnly，但不把网络工具纳入静默放行。"""
+
+    if target.category in {"write", "edit", "delete", "network"}:
+        return False
+    return _target_is_read_only(tool, target, ctx)
+
+
+def _target_is_read_only(tool: BaseTool | None, target: PermissionTarget, ctx: ToolExecutionContext) -> bool:
+    if tool is None and ctx.tool_registry is not None:
+        candidate = ctx.tool_registry.get(target.tool_name)
+        if isinstance(candidate, BaseTool):
+            tool = candidate
+    if tool is None or target.raw is None:
+        return False
+    try:
+        return bool(tool.is_read_only(target.raw, ctx))
+    except Exception:
+        return False
 
 
 def _is_unrelaxable(decision: PermissionDecision) -> bool:

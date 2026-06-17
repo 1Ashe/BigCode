@@ -41,6 +41,9 @@ class ReadTool(BaseTool[ReadInput, dict]):
     def is_concurrency_safe(self, input: ReadInput, ctx: ToolExecutionContext) -> bool:
         return True
 
+    def is_read_only(self, input: ReadInput, ctx: ToolExecutionContext) -> bool:
+        return True
+
     async def validate_input(self, input: ReadInput, ctx: ToolExecutionContext) -> ValidationResult:
         try:
             resolved = resolve_path(input.file_path, ctx.cwd, ctx.workspace_roots, must_exist=True)
@@ -55,7 +58,7 @@ class ReadTool(BaseTool[ReadInput, dict]):
         decision = check_content_policy(target, ctx)
         if decision:
             return decision
-        decision = check_mode_policy_for_target(target, ctx)
+        decision = check_mode_policy_for_target(target, ctx, self)
         if decision:
             return decision
         try:

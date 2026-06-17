@@ -24,6 +24,9 @@ class ExternalPromptGetTool(BaseTool[ExternalPromptGetInput, dict]):
     def is_concurrency_safe(self, input: ExternalPromptGetInput, ctx: ToolExecutionContext) -> bool:
         return True
 
+    def is_read_only(self, input: ExternalPromptGetInput, ctx: ToolExecutionContext) -> bool:
+        return True
+
     async def validate_input(self, input: ExternalPromptGetInput, ctx: ToolExecutionContext) -> ValidationResult:
         if not ctx.mcp_manager:
             return ValidationResult(False, "MCP manager is not configured.")

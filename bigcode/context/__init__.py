@@ -7,6 +7,7 @@ from .attachments import Attachment, wrap_system_reminder
 from .messages import (
     ApiMessage,
     AssistantMessage,
+    AttachmentMessage,
     CompactRecordMessage,
     ContextSummaryMessage,
     MessageBase,
@@ -23,6 +24,7 @@ __all__ = [
     "ApiMessage",
     "AssistantMessage",
     "Attachment",
+    "AttachmentMessage",
     "CompactRecordMessage",
     "ContextSummaryMessage",
     "MessageBase",

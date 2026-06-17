@@ -17,6 +17,9 @@ class PlanShowTool(BaseTool[EmptyInput, dict]):
     def is_concurrency_safe(self, input: EmptyInput, ctx: ToolExecutionContext) -> bool:
         return True
 
+    def is_read_only(self, input: EmptyInput, ctx: ToolExecutionContext) -> bool:
+        return True
+
     async def validate_input(self, input: EmptyInput, ctx: ToolExecutionContext) -> ValidationResult:
         if ctx.plan_store is None:
             return ValidationResult(False, "Plan store is not configured.")

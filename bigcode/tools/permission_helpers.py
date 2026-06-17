@@ -11,7 +11,7 @@ def allow_with_mode_policy(tool: BaseTool, input: BaseModel, ctx: ToolExecutionC
     """Return allow unless the current mode/sandbox forbids this tool."""
 
     target = build_permission_target(tool, input)
-    decision = check_mode_policy_for_target(target, ctx)
+    decision = check_mode_policy_for_target(target, ctx, tool)
     if decision:
         return decision
     return PermissionDecision("allow", message=message, updated_input=input)

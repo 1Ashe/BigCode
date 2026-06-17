@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from .attachments import Attachment
 from bigcode.utils.ids import new_id
 
 
@@ -162,6 +163,32 @@ class SystemMessage(MessageBase):
         self.content = content
         self.subtype = subtype
         self.level = level
+
+
+@dataclass
+class AttachmentMessage(MessageBase):
+    """内部附件消息。
+
+    它只参与本次上下文投影，不在 builder 阶段提前转成 UserMessage。
+    normalizer 会在发 API 前按 CC 风格重排并展开成 meta user 消息。
+    """
+    attachment: Attachment = field(default_factory=lambda: Attachment(type="empty", text=""))
+
+    def __init__(
+        self,
+        attachment: Attachment,
+        *,
+        uuid: str | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        super().__init__(
+            type="attachment",
+            uuid=uuid or new_id("msg"),
+            timestamp=time.time() if timestamp is None else timestamp,
+            is_meta=True,
+            origin=attachment.source,
+        )
+        self.attachment = attachment
 
 
 @dataclass

@@ -14,6 +14,7 @@ from .attachments import Attachment, wrap_system_reminder
 from .messages import (
     ApiMessage,
     AssistantMessage,
+    AttachmentMessage,
     ContextSummaryMessage,
     MessageBase,
     TextBlock,
@@ -25,7 +26,7 @@ from .messages import (
 
 
 def attachment_to_user_message(att: Attachment) -> UserMessage:
-    """把 Attachment 包装成 meta UserMessage，最终让模型作为系统提醒看到。"""
+    """把 Attachment 包装成 meta UserMessage，供 API projection 使用。"""
     return UserMessage(wrap_system_reminder(att.text), is_meta=True, origin=att.source)
 
 
@@ -49,7 +50,9 @@ def _normalize_messages_for_anthropic(system_prompt: str, messages: list[Message
     # Claude 工具协议要求 assistant 发出 tool_use 后，后续 user 消息必须带回
     # 对应的 tool_result。这个集合专门追踪“还没收到结果”的 tool_use id。
     pending_tool_use_ids: set[str] = set()
-    for msg in messages:
+    for msg in _reorder_attachments_for_api(messages):
+        if isinstance(msg, AttachmentMessage):
+            msg = attachment_to_user_message(msg.attachment)
         if isinstance(msg, UserMessage):
             blocks: list[dict[str, Any]] = []
             text_parts: list[str] = []
@@ -114,7 +117,9 @@ def _normalize_messages_for_openai(system_prompt: str, messages: list[MessageBas
     _ = system_prompt
     result: list[dict[str, Any]] = []
 
-    for msg in messages:
+    for msg in _reorder_attachments_for_api(messages):
+        if isinstance(msg, AttachmentMessage):
+            msg = attachment_to_user_message(msg.attachment)
         if isinstance(msg, UserMessage):
             text_parts: list[str] = []
             def flush_user_text() -> None:
@@ -236,7 +241,42 @@ def _merge_adjacent_users(messages: list[ApiMessage]) -> list[ApiMessage]:
     merged: list[ApiMessage] = []
     for msg in messages:
         if merged and msg.role == "user" and merged[-1].role == "user":
-            merged[-1].content.extend(msg.content)
+            merged[-1].content = _hoist_tool_result_blocks([*merged[-1].content, *msg.content])
         else:
             merged.append(msg)
     return merged
+
+
+def _reorder_attachments_for_api(messages: list[MessageBase]) -> list[MessageBase]:
+    """让附件在 API 投影前向上冒泡，直到 assistant 或 tool_result user。"""
+    result: list[MessageBase] = []
+    pending: list[AttachmentMessage] = []
+    for message in reversed(messages):
+        if isinstance(message, AttachmentMessage):
+            pending.append(message)
+            continue
+        if pending and _is_attachment_stop_point(message):
+            result.extend(pending)
+            result.append(message)
+            pending.clear()
+        else:
+            result.append(message)
+    result.extend(pending)
+    result.reverse()
+    return result
+
+
+def _is_attachment_stop_point(message: MessageBase) -> bool:
+    if isinstance(message, AssistantMessage):
+        return True
+    return (
+        isinstance(message, UserMessage)
+        and bool(message.content)
+        and isinstance(message.content[0], ToolResultBlock)
+    )
+
+
+def _hoist_tool_result_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tool_results = [block for block in blocks if block.get("type") == "tool_result"]
+    others = [block for block in blocks if block.get("type") != "tool_result"]
+    return [*tool_results, *others]

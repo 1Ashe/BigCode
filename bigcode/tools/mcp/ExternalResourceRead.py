@@ -23,6 +23,9 @@ class ExternalResourceReadTool(BaseTool[ExternalResourceReadInput, dict]):
     def is_concurrency_safe(self, input: ExternalResourceReadInput, ctx: ToolExecutionContext) -> bool:
         return True
 
+    def is_read_only(self, input: ExternalResourceReadInput, ctx: ToolExecutionContext) -> bool:
+        return True
+
     async def validate_input(self, input: ExternalResourceReadInput, ctx: ToolExecutionContext) -> ValidationResult:
         if not ctx.mcp_manager:
             return ValidationResult(False, "MCP manager is not configured.")

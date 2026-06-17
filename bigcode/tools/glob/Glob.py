@@ -37,6 +37,9 @@ class GlobTool(BaseTool[GlobInput, dict]):
     def is_concurrency_safe(self, input: GlobInput, ctx: ToolExecutionContext) -> bool:
         return True
 
+    def is_read_only(self, input: GlobInput, ctx: ToolExecutionContext) -> bool:
+        return True
+
     async def validate_input(self, input: GlobInput, ctx: ToolExecutionContext) -> ValidationResult:
         if not input.pattern:
             return ValidationResult(False, "pattern must not be empty.")
@@ -53,7 +56,7 @@ class GlobTool(BaseTool[GlobInput, dict]):
         decision = check_content_policy(target, ctx)
         if decision:
             return decision
-        decision = check_mode_policy_for_target(target, ctx)
+        decision = check_mode_policy_for_target(target, ctx, self)
         if decision:
             return decision
         try:

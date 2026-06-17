@@ -41,6 +41,9 @@ class WebFetchTool(BaseTool[WebFetchInput, dict]):
     def is_concurrency_safe(self, input: WebFetchInput, ctx: ToolExecutionContext) -> bool:
         return True
 
+    def is_read_only(self, input: WebFetchInput, ctx: ToolExecutionContext) -> bool:
+        return True
+
     async def validate_input(self, input: WebFetchInput, ctx: ToolExecutionContext) -> ValidationResult:
         parsed = urlparse(input.url)
         if parsed.scheme not in {"http", "https"}:

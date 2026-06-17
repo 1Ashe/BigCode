@@ -26,6 +26,9 @@ class TaskStopTool(BaseTool[TaskStopInput, dict]):
     def is_concurrency_safe(self, input: TaskStopInput, ctx: ToolExecutionContext) -> bool:
         return False
 
+    def is_read_only(self, input: TaskStopInput, ctx: ToolExecutionContext) -> bool:
+        return False
+
     async def validate_input(self, input: TaskStopInput, ctx: ToolExecutionContext) -> ValidationResult:
         if ctx.agent_session is None and ctx.project_state_dir is None:
             return ValidationResult(False, "Background subAgent task store is not configured.")

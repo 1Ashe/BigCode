@@ -25,6 +25,9 @@ class TaskGetTool(BaseTool[TaskGetInput, dict]):
     def is_concurrency_safe(self, input: TaskGetInput, ctx: ToolExecutionContext) -> bool:
         return True
 
+    def is_read_only(self, input: TaskGetInput, ctx: ToolExecutionContext) -> bool:
+        return True
+
     async def validate_input(self, input: TaskGetInput, ctx: ToolExecutionContext) -> ValidationResult:
         if not ctx.task_store:
             return ValidationResult(False, "Task store is not configured.")

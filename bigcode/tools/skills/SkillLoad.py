@@ -27,6 +27,9 @@ class SkillLoadTool(BaseTool[SkillLoadInput, dict]):
     def is_concurrency_safe(self, input: SkillLoadInput, ctx: ToolExecutionContext) -> bool:
         return True
 
+    def is_read_only(self, input: SkillLoadInput, ctx: ToolExecutionContext) -> bool:
+        return True
+
     async def validate_input(self, input: SkillLoadInput, ctx: ToolExecutionContext) -> ValidationResult:
         if not ctx.skill_registry:
             return ValidationResult(False, "Skill registry is not configured.")

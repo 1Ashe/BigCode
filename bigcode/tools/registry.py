@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from .base import BaseTool
@@ -20,6 +21,15 @@ class ToolRoute:
     metadata: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class ToolSearchMatch:
+    """延迟工具搜索结果。"""
+
+    tool: BaseTool
+    score: int
+    reasons: tuple[str, ...] = ()
+
+
 class ToolRegistry:
     """工具名称到工具实例的映射表。
 
@@ -29,6 +39,7 @@ class ToolRegistry:
         """初始化工具名表和路由表。"""
         self._tools: dict[str, BaseTool] = {}
         self._routes: dict[str, ToolRoute] = {}
+        self._discovered: set[str] = set()
 
     def register(self, tool: BaseTool, *, route: ToolRoute | None = None) -> None:
         """注册工具主名称和所有别名。"""
@@ -66,8 +77,82 @@ class ToolRegistry:
             out.append(tool)
         return out
 
+    def is_deferred(self, tool: BaseTool) -> bool:
+        """判断工具是否默认延迟暴露给模型。"""
+        if getattr(tool, "always_load", False):
+            return False
+        if tool.name == "Tool_Search":
+            return False
+        if getattr(tool, "is_mcp", False):
+            return True
+        return bool(getattr(tool, "should_defer", False))
+
+    def deferred_tools(self) -> list[BaseTool]:
+        """返回所有延迟工具，不区分是否已经被发现。"""
+        return [tool for tool in self.list_tools() if self.is_deferred(tool)]
+
+    def discovered_tool_names(self) -> set[str]:
+        """返回已经通过 Tool_Search 发现的规范工具名。"""
+        return set(self._discovered)
+
+    def mark_discovered(self, name: str) -> bool:
+        """把延迟工具标记为已发现；name 可以是主名称或别名。"""
+        tool = self.get(name)
+        if tool is None or not self.is_deferred(tool):
+            return False
+        self._discovered.add(tool.name)
+        return True
+
+    def mark_discovered_many(self, names: list[str]) -> list[str]:
+        """批量标记已发现工具，并返回成功发现的规范工具名。"""
+        discovered: list[str] = []
+        for name in names:
+            tool = self.get(name)
+            if tool is None:
+                continue
+            if self.mark_discovered(name):
+                discovered.append(tool.name)
+        return _dedupe(discovered)
+
+    def inherit_discoveries_from(self, other: "ToolRegistry") -> None:
+        """复制另一个 registry 中当前 registry 也拥有的发现状态。"""
+        for name in other.discovered_tool_names():
+            self.mark_discovered(name)
+
+    def find_deferred_by_names(self, names: list[str]) -> list[BaseTool]:
+        """按主名称或别名精确查找延迟工具。"""
+        matches: list[BaseTool] = []
+        for name in names:
+            tool = self.get(name)
+            if tool is None:
+                tool = self._get_case_insensitive(name)
+            if tool is not None and self.is_deferred(tool):
+                matches.append(tool)
+        return _dedupe_tools(matches)
+
+    def search_deferred(self, query: str, *, max_results: int = 5) -> list[ToolSearchMatch]:
+        """按名称、别名、描述和 search_hint 检索延迟工具。"""
+        terms = _query_terms(query)
+        if not terms:
+            return []
+        matches: list[ToolSearchMatch] = []
+        for tool in self.deferred_tools():
+            score, reasons = _score_tool(tool, terms, query)
+            if score > 0:
+                matches.append(ToolSearchMatch(tool=tool, score=score, reasons=tuple(reasons)))
+        matches.sort(key=lambda item: (-item.score, item.tool.name))
+        return matches[:max_results]
+
+    def _get_case_insensitive(self, name: str) -> BaseTool | None:
+        """按大小写不敏感名称查找工具，服务 select: 容错。"""
+        lowered = name.lower()
+        for registered_name, tool in self._tools.items():
+            if registered_name.lower() == lowered:
+                return tool
+        return None
+
     def schemas_for_model(self) -> list[dict[str, Any]]:
-        """把所有去重后的工具转换成模型 API 需要的 schema 列表。"""
+        """把当前已暴露的工具转换成模型 API 需要的 schema 列表。"""
         return [
             {
                 "name": tool.name,
@@ -75,6 +160,7 @@ class ToolRegistry:
                 "input_schema": tool.json_schema(),
             }
             for tool in self.list_tools()
+            if not self.is_deferred(tool) or tool.name in self._discovered
         ]
 
 
@@ -107,6 +193,7 @@ def build_default_registry() -> ToolRegistry:
     from .tasks.TaskGet import TaskGetTool
     from .tasks.TaskList import TaskListTool
     from .tasks.TaskUpdate import TaskUpdateTool
+    from .tool_search.Tool_Search import ToolSearchTool
     from .web_fetch.WebFetch import WebFetchTool
     from .web_search.WebSearch import WebSearchTool
     from .write.Write import WriteTool
@@ -122,6 +209,7 @@ def build_default_registry() -> ToolRegistry:
         GlobTool(),
         GrepTool(),
         BashTool(),
+        ToolSearchTool(),
         WebFetchTool(),
         WebSearchTool(),
         TaskCreateTool(),
@@ -147,3 +235,74 @@ def build_default_registry() -> ToolRegistry:
     ]:
         registry.register(tool)
     return registry
+
+
+def _query_terms(query: str) -> list[str]:
+    return _dedupe([term.lower() for term in re.findall(r"[A-Za-z0-9_.:-]+", query) if term.strip()])
+
+
+def _score_tool(tool: BaseTool, terms: list[str], raw_query: str) -> tuple[int, list[str]]:
+    names = [tool.name, *getattr(tool, "aliases", ())]
+    lower_names = [name.lower() for name in names]
+    name_parts = _tool_name_parts(tool.name)
+    description = (tool.description or "").lower()
+    search_hint = (getattr(tool, "search_hint", "") or "").lower()
+    is_mcp = bool(getattr(tool, "is_mcp", False))
+    score = 0
+    reasons: list[str] = []
+    raw = raw_query.strip().lower()
+    if raw and raw in lower_names:
+        score += 14 if is_mcp else 12
+        reasons.append("exact-name")
+    for term in terms:
+        if term in lower_names:
+            score += 12 if is_mcp else 10
+            reasons.append(f"name:{term}")
+            continue
+        if term in name_parts:
+            score += 12 if is_mcp else 10
+            reasons.append(f"name-part:{term}")
+            continue
+        if any(term in part for part in name_parts):
+            score += 6 if is_mcp else 5
+            reasons.append(f"partial-name-part:{term}")
+        if any(term in name for name in lower_names):
+            score += 3
+            reasons.append(f"partial-name:{term}")
+        if search_hint and term in search_hint:
+            score += 4
+            reasons.append(f"hint:{term}")
+        if re.search(rf"\b{re.escape(term)}\b", description):
+            score += 2
+            reasons.append(f"description:{term}")
+    return score, _dedupe(reasons)
+
+
+def _tool_name_parts(name: str) -> list[str]:
+    if name.startswith("mcp__"):
+        value = name.removeprefix("mcp__").lower().replace("__", " ").replace("_", " ").replace("-", " ")
+    else:
+        value = re.sub(r"([a-z])([A-Z])", r"\1 \2", name).replace("_", " ").replace("-", " ").lower()
+    return [part for part in re.split(r"\s+", value) if part]
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _dedupe_tools(tools: list[BaseTool]) -> list[BaseTool]:
+    seen: set[int] = set()
+    out: list[BaseTool] = []
+    for tool in tools:
+        if id(tool) in seen:
+            continue
+        seen.add(id(tool))
+        out.append(tool)
+    return out

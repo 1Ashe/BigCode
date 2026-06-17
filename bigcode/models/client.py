@@ -14,11 +14,11 @@ from bigcode.config.models import ResolvedModel
 from bigcode.context.messages import ApiMessage
 
 from .events import (
-    StreamEnd,
     StreamEvent,
-    TextDelta,
-    ThinkingComplete,
-    ThinkingDelta,
+    StreamEnd,
+    TextDelta,          
+    ThinkingComplete,   
+    ThinkingDelta,      
     ToolCallComplete,
     ToolCallDelta,
     ToolCallStart,

@@ -58,6 +58,7 @@ class ToolRunner:
 
         会修改状态的工具必须等前面的安全批次完成后再单独执行。
         """
+        self._ensure_registry_context(ctx)
         results: list[ToolRunResult[Any] | None] = [None] * len(tool_uses)
         safe_batch: list[tuple[int, ToolUse]] = []
 
@@ -93,6 +94,7 @@ class ToolRunner:
 
         阅读这个方法能看到工具系统的主链路：找工具、Pydantic 校验、hook、权限、call、截断和 PostToolUse。
         """
+        self._ensure_registry_context(ctx)
         started = time.perf_counter()
         self._emit_tool_started(tool_use, ctx)
 
@@ -364,7 +366,7 @@ class ToolRunner:
     def _is_concurrency_safe(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> bool:
         """判断某个工具调用能否和其它工具并发运行。
 
-        默认只有 state_effect=none 的工具才是安全的。
+        当前并发语义跟随工具自己的只读判断。
         """
         tool = self.registry.get(tool_use.name)
         if tool is None:
@@ -373,7 +375,12 @@ class ToolRunner:
             input_model = tool.input_model.model_validate(tool_use.input)
         except ValidationError:
             return False
-        return tool.is_concurrency_safe(input_model, ctx)
+        return tool.is_read_only(input_model, ctx)
+
+    def _ensure_registry_context(self, ctx: ToolExecutionContext) -> None:
+        """让工具调用能访问当前 registry，例如 Tool_Search 标记 discovered 工具。"""
+        if ctx.tool_registry is None:
+            ctx.tool_registry = self.registry
 
     def _offload_large_result(self, result: ToolRunResult[Any], max_chars: int, ctx: ToolExecutionContext) -> None:
         """把超大工具结果写入 artifact 文件，并把 artifact 元数据塞回结果里。"""
@@ -454,13 +461,21 @@ def _auto_approve_permission(tool: Any, input_model: Any, decision: PermissionDe
     if decision.reason_type in {"rule", "safetyCheck", "requiresUserInteraction"}:
         return False
     target = build_permission_target(tool, input_model)
-    if target.category in {"read", "skill"}:
+    read_only = _tool_is_read_only(tool, input_model, ctx)
+    if target.category in {"read", "skill"} and read_only:
         return True
-    if target.category == "state" and tool.name in {"PlanShow", "TaskList", "TaskGet", "TaskOutput"}:
+    if target.category == "state" and read_only:
         return True
-    if tool.name == "Bash" and target.command and classify_bash(target.command) == "read":
+    if target.category == "bash" and read_only:
         return True
     return False
+
+
+def _tool_is_read_only(tool: Any, input_model: Any, ctx: ToolExecutionContext) -> bool:
+    try:
+        return bool(tool.is_read_only(input_model, ctx))
+    except Exception:
+        return False
 
 
 def _permission_summary(tool_name: str, data: dict[str, Any], ctx: ToolExecutionContext) -> str:

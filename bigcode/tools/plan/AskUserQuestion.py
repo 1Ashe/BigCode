@@ -50,6 +50,9 @@ class AskUserQuestionTool(BaseTool[AskUserQuestionInput, dict]):
     def is_concurrency_safe(self, input: AskUserQuestionInput, ctx: ToolExecutionContext) -> bool:
         return False
 
+    def is_read_only(self, input: AskUserQuestionInput, ctx: ToolExecutionContext) -> bool:
+        return False
+
     async def validate_input(self, input: AskUserQuestionInput, ctx: ToolExecutionContext) -> ValidationResult:
         if not 1 <= len(input.questions) <= 3:
             return ValidationResult(False, "AskUserQuestion requires 1-3 questions.")

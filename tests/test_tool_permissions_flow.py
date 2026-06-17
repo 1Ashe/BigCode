@@ -39,6 +39,9 @@ class FixedPermissionTool(BaseTool[FixedPermissionInput, dict]):
     def is_concurrency_safe(self, input: FixedPermissionInput, ctx: ToolExecutionContext) -> bool:
         return False
 
+    def is_read_only(self, input: FixedPermissionInput, ctx: ToolExecutionContext) -> bool:
+        return False
+
     async def validate_input(self, input: FixedPermissionInput, ctx: ToolExecutionContext):
         from bigcode.tools.base import ValidationResult
 
@@ -168,7 +171,7 @@ class ToolPermissionFlowTests(unittest.TestCase):
             self.assertEqual((root / "x.txt").read_text(encoding="utf-8"), "x")
 
     def test_default_registry_tools_override_lifecycle_methods(self) -> None:
-        methods = {"is_enabled", "is_concurrency_safe", "validate_input", "check_permissions", "call"}
+        methods = {"is_enabled", "is_concurrency_safe", "is_read_only", "validate_input", "check_permissions", "call"}
         missing: list[str] = []
         for tool in build_default_registry().list_tools():
             for method in methods:

@@ -12,8 +12,8 @@ from bigcode.hooks.models import HookInput
 
 from .attachments import Attachment
 from .compact import CompactDeps, ContextCompactResult, ContextCompactState, apply_context_compact
-from .messages import ApiMessage, MessageBase
-from .normalizer import attachment_to_user_message, normalize_messages_for_api
+from .messages import ApiMessage, AttachmentMessage, MessageBase
+from .normalizer import normalize_messages_for_api
 
 
 @dataclass
@@ -79,7 +79,7 @@ async def build_context_for_api(messages: list[MessageBase], deps: ContextBuildD
         )
         attachments.extend(agg.attachments)
 
-    attachment_messages = [attachment_to_user_message(att) for att in attachments]
+    attachment_messages = [AttachmentMessage(att) for att in attachments]
     if deps.hook_bus:
         await deps.hook_bus.emit(
             "PreCompact",

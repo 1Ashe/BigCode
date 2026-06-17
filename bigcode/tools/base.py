@@ -100,6 +100,7 @@ class ToolExecutionContext:
     event_sink: Any | None = None
     artifact_store: Any | None = None
     project_state_dir: Path | None = None
+    tool_registry: Any | None = None
 
 
 class BaseTool(ABC, Generic[InputT, OutputT]):
@@ -114,13 +115,21 @@ class BaseTool(ABC, Generic[InputT, OutputT]):
     permission_category: PermissionCategory
     state_effect: StateEffect = "external"
     max_result_chars: int = 100_000
+    should_defer: bool = False
+    always_load: bool = False
+    is_mcp: bool = False
+    search_hint: str = ""
 
     def is_enabled(self, ctx: ToolExecutionContext) -> bool:
         """判断工具在当前上下文是否可用；默认所有工具都启用。"""
         return True
 
     def is_concurrency_safe(self, input: InputT, ctx: ToolExecutionContext) -> bool:
-        """判断工具是否可并发执行；默认只有不会改变状态的工具可并发。"""
+        """判断工具是否可并发执行；默认跟随只读判断。"""
+        return self.is_read_only(input, ctx)
+
+    def is_read_only(self, input: InputT, ctx: ToolExecutionContext) -> bool:
+        """判断当前输入是否只读取外部或内部状态，不会产生持久副作用。"""
         return self.state_effect == "none"
 
     async def validate_input(self, input: InputT, ctx: ToolExecutionContext) -> ValidationResult:

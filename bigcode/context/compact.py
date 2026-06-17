@@ -12,6 +12,7 @@ from bigcode.utils.jsonio import to_jsonable
 
 from .messages import (
     AssistantMessage,
+    AttachmentMessage,
     CompactRecordMessage,
     ContextSummaryMessage,
     MessageBase,
@@ -293,6 +294,8 @@ def estimate_message_tokens(message: MessageBase) -> int:
                 total += _estimate_tool_result_tokens(block.content)
     elif isinstance(message, ContextSummaryMessage):
         total += estimate_text_tokens(message.summary)
+    elif isinstance(message, AttachmentMessage):
+        total += estimate_text_tokens(message.attachment.text)
     elif isinstance(message, SystemMessage):
         total += estimate_text_tokens(message.content)
     return max(1, math.ceil(total * 4 / 3)) if total else 0

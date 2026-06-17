@@ -15,8 +15,16 @@ from pydantic import BaseModel
 
 from bigcode.config import load_runtime_config
 from bigcode.config.models import ResolvedModel
+from bigcode.context.attachments import Attachment
 from bigcode.context.builder import ContextBuildDeps, build_context_for_api
-from bigcode.context.messages import ApiMessage, AssistantMessage, ToolResultBlock, ToolUseBlock, UserMessage
+from bigcode.context.messages import (
+    ApiMessage,
+    AssistantMessage,
+    AttachmentMessage,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
 from bigcode.context.normalizer import normalize_messages_for_api
 from bigcode.hooks import HookBus
 from bigcode.hooks.builtins import register_builtin_hooks
@@ -259,6 +267,35 @@ class BigCodeCoreTests(unittest.TestCase):
         self.assertEqual(api[1].content[0]["type"], "tool_result")
         self.assertEqual(api[1].content[1]["type"], "text")
         self.assertIn("Orphaned tool result", api[1].content[1]["text"])
+
+    def test_normalizer_reorders_and_merges_attachments(self) -> None:
+        api = normalize_messages_for_api(
+            "system",
+            [
+                UserMessage("implement this"),
+                AttachmentMessage(Attachment(type="context", text="extra context", source="hooks")),
+            ],
+        )
+
+        self.assertEqual(len(api), 1)
+        self.assertEqual(api[0].role, "user")
+        self.assertIn("extra context", api[0].content[0]["text"])
+        self.assertEqual(api[0].content[1]["text"], "implement this")
+
+    def test_normalizer_keeps_attachments_after_tool_results(self) -> None:
+        api = normalize_messages_for_api(
+            "system",
+            [
+                AssistantMessage([ToolUseBlock(id="use_1", name="Read", input={})]),
+                UserMessage([ToolResultBlock(tool_use_id="use_1", content="result")], is_meta=True, origin="tool"),
+                AttachmentMessage(Attachment(type="hook_context", text="post tool context", source="hooks")),
+            ],
+        )
+
+        self.assertEqual([msg.role for msg in api], ["assistant", "user"])
+        self.assertEqual(api[1].content[0]["type"], "tool_result")
+        self.assertEqual(api[1].content[1]["type"], "text")
+        self.assertIn("post tool context", api[1].content[1]["text"])
 
     def test_read_duplicate_and_write_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -613,6 +650,7 @@ class BigCodeCoreTests(unittest.TestCase):
                 )
             )
             active_text = built.api_messages[0].content[0]["text"]
+            self.assertIsInstance(built.context_messages[0], AttachmentMessage)
             self.assertIn("Write the final implementation plan", active_text)
 
             cap_built = asyncio.run(

@@ -37,6 +37,9 @@ class WriteTool(BaseTool[WriteInput, dict]):
     def is_concurrency_safe(self, input: WriteInput, ctx: ToolExecutionContext) -> bool:
         return False
 
+    def is_read_only(self, input: WriteInput, ctx: ToolExecutionContext) -> bool:
+        return False
+
     async def validate_input(self, input: WriteInput, ctx: ToolExecutionContext) -> ValidationResult:
         try:
             resolved = resolve_path(input.file_path, ctx.cwd, ctx.workspace_roots, must_exist=False)
@@ -51,7 +54,7 @@ class WriteTool(BaseTool[WriteInput, dict]):
         decision = check_content_policy(target, ctx)
         if decision:
             return decision
-        decision = check_mode_policy_for_target(target, ctx)
+        decision = check_mode_policy_for_target(target, ctx, self)
         if decision:
             return decision
         try:

@@ -35,6 +35,9 @@ class WebSearchTool(BaseTool[WebSearchInput, dict]):
     def is_concurrency_safe(self, input: WebSearchInput, ctx: ToolExecutionContext) -> bool:
         return True
 
+    def is_read_only(self, input: WebSearchInput, ctx: ToolExecutionContext) -> bool:
+        return True
+
     async def validate_input(self, input: WebSearchInput, ctx: ToolExecutionContext) -> ValidationResult:
         if not input.query.strip():
             return ValidationResult(False, "query must not be empty.")

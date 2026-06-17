@@ -39,6 +39,9 @@ class EditTool(BaseTool[EditInput, dict]):
     def is_concurrency_safe(self, input: EditInput, ctx: ToolExecutionContext) -> bool:
         return False
 
+    def is_read_only(self, input: EditInput, ctx: ToolExecutionContext) -> bool:
+        return False
+
     async def validate_input(self, input: EditInput, ctx: ToolExecutionContext) -> ValidationResult:
         if input.old_string == "":
             return ValidationResult(False, "old_string must not be empty.")
@@ -55,7 +58,7 @@ class EditTool(BaseTool[EditInput, dict]):
         decision = check_content_policy(target, ctx)
         if decision:
             return decision
-        decision = check_mode_policy_for_target(target, ctx)
+        decision = check_mode_policy_for_target(target, ctx, self)
         if decision:
             return decision
         try:

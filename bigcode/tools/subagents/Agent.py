@@ -30,6 +30,10 @@ class AgentTool(BaseTool[AgentToolInput, dict]):
     def is_concurrency_safe(self, input: AgentToolInput, ctx: ToolExecutionContext) -> bool:
         return False
 
+    def is_read_only(self, input: AgentToolInput, ctx: ToolExecutionContext) -> bool:
+        subagent_type = input.subagent_type or "general-purpose"
+        return subagent_type in {"explorer", "planAgent"} and not (input.background or input.run_in_background)
+
     async def validate_input(self, input: AgentToolInput, ctx: ToolExecutionContext) -> ValidationResult:
         if not input.prompt.strip():
             return ValidationResult(False, "prompt must not be empty.")
@@ -44,7 +48,7 @@ class AgentTool(BaseTool[AgentToolInput, dict]):
         decision = check_content_policy(target, ctx)
         if decision:
             return decision
-        decision = check_mode_policy_for_target(target, ctx)
+        decision = check_mode_policy_for_target(target, ctx, self)
         if decision:
             return decision
         return PermissionDecision("passthrough", updated_input=input)

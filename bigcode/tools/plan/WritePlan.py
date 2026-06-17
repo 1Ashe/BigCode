@@ -23,6 +23,9 @@ class WritePlanTool(BaseTool[WritePlanInput, dict]):
     def is_concurrency_safe(self, input: WritePlanInput, ctx: ToolExecutionContext) -> bool:
         return False
 
+    def is_read_only(self, input: WritePlanInput, ctx: ToolExecutionContext) -> bool:
+        return False
+
     async def validate_input(self, input: WritePlanInput, ctx: ToolExecutionContext) -> ValidationResult:
         if ctx.plan_state is None or ctx.plan_store is None or not ctx.plan_state.active:
             return ValidationResult(False, "WritePlan requires active Plan Mode.")

@@ -52,6 +52,7 @@ from bigcode.subagents.tasks import AgentRunResult, AgentTaskState, AgentTaskSto
 from bigcode.tasks import TaskStore
 from bigcode.tools.artifacts import ArtifactStore
 from bigcode.tools import ToolExecutionContext, ToolRegistry, ToolRunner, ToolUse, build_default_registry
+from bigcode.tools.mcp import register_mcp_tools_from_capabilities
 from bigcode.tools.permissions import ToolPermissionContext, PermissionRule
 from bigcode.tools.read_file_state import ReadFileState
 from bigcode.tui import BigCodeTUI
@@ -207,6 +208,7 @@ class AgentSession:
             event_sink=self.event_sink,
             artifact_store=self.artifact_store,
             project_state_dir=self.config.project_state_dir,
+            tool_registry=self.registry,
         )
 
     async def start(self) -> None:
@@ -238,6 +240,7 @@ class AgentSession:
         for step in range(max_steps):
             self.compact_state.step_index = step
             self._emit_status("model_request_started", step=step)
+            await self._sync_mcp_tools_to_registry()
 
             # 每一步请求模型前都重新构建上下文，因为上一轮工具结果、hook 附件、
             # Plan Mode 状态等都可能刚刚变化。
@@ -786,9 +789,22 @@ class AgentSession:
         if self.config.mcp_enabled:
             if self.mcp_manager.fastmcp_available:
                 caps.append("MCP external tools/resources/prompts configured")
+                for tool in self.registry.deferred_tools():
+                    if getattr(tool, "is_mcp", False):
+                        caps.append(f"Deferred MCP tool available via Tool_Search: {tool.name}")
             else:
                 caps.append("MCP configured but FastMCP is not installed; MCP calls will report dependency_missing")
         return caps
+
+    async def _sync_mcp_tools_to_registry(self) -> list[str]:
+        """发现 MCP tools，并把它们注册成可被 Tool_Search 加载的动态工具。"""
+        if not self.config.mcp_enabled or not self.mcp_manager.fastmcp_available:
+            return []
+        try:
+            capabilities = await self.mcp_manager.discover()
+        except Exception:
+            return []
+        return register_mcp_tools_from_capabilities(self.registry, capabilities)
 
     def _model_protocol_label(self) -> str:
         """返回当前模型协议；配置错误时返回占位文本。"""
@@ -1048,4 +1064,5 @@ def _registry_for_subagent(parent: ToolRegistry, definition: AgentDefinition, *,
         if names.intersection(disallowed):
             continue
         child.register(tool)
+    child.inherit_discoveries_from(parent)
     return child

@@ -11,16 +11,19 @@ from unittest.mock import patch
 from bigcode.agent.session import AgentSession
 from bigcode.config import load_runtime_config
 from bigcode.config.models import CompactConfig
+from bigcode.context.attachments import Attachment
 from bigcode.context.compact import (
     TIME_BASED_CLEARED_MESSAGE,
     CompactDeps,
     ContextCompactState,
     apply_context_compact,
     build_message_groups,
+    estimate_context_tokens,
     replay_compact_records,
 )
 from bigcode.context.messages import (
     AssistantMessage,
+    AttachmentMessage,
     CompactRecordMessage,
     ContextSummaryMessage,
     SystemPromptSnapshotMessage,
@@ -35,6 +38,17 @@ from bigcode.models.claude_compatible import ModelResponse
 
 
 class CompactTests(unittest.TestCase):
+    def test_attachment_messages_count_in_extra_context_budget(self) -> None:
+        deps = CompactDeps(
+            extra_context_messages=[
+                AttachmentMessage(
+                    Attachment(type="context", text="extra context for model", source="hooks")
+                )
+            ]
+        )
+
+        self.assertGreater(estimate_context_tokens([], deps), 0)
+
     def test_time_microcompact_persists_without_mutating_ui_results(self) -> None:
         messages = []
         for index in range(7):

@@ -39,6 +39,9 @@ class BashTool(BaseTool[BashInput, dict]):
     def is_concurrency_safe(self, input: BashInput, ctx: ToolExecutionContext) -> bool:
         return classify_bash(input.command) == "read"
 
+    def is_read_only(self, input: BashInput, ctx: ToolExecutionContext) -> bool:
+        return classify_bash(input.command) == "read"
+
     async def validate_input(self, input: BashInput, ctx: ToolExecutionContext) -> ValidationResult:
         if not input.command.strip():
             return ValidationResult(False, "command must not be empty.")
@@ -49,7 +52,7 @@ class BashTool(BaseTool[BashInput, dict]):
         decision = check_content_policy(target, ctx)
         if decision:
             return decision
-        decision = check_mode_policy_for_target(target, ctx)
+        decision = check_mode_policy_for_target(target, ctx, self)
         if decision:
             return decision
         kind = classify_bash(input.command)

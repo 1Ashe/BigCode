@@ -22,6 +22,10 @@ class McpCapability:
     description: str = ""
     schema: dict[str, Any] = field(default_factory=dict)
     read_only_hint: bool = False
+    destructive_hint: bool = False
+    open_world_hint: bool = False
+    search_hint: str = ""
+    always_load: bool = False
 
 
 class McpClientManager:
@@ -63,6 +67,8 @@ class McpClientManager:
                 for tool in tools or []:
                     # 不同 MCP/FastMCP 版本字段名可能略有差异，所以用 _obj_get
                     # 同时兼容 dict、对象属性、inputSchema/input_schema。
+                    annotations = _obj_get(tool, "annotations", {}) or {}
+                    meta = _obj_get(tool, "_meta", {}) or {}
                     discovered.append(
                         McpCapability(
                             kind="tool",
@@ -70,7 +76,11 @@ class McpClientManager:
                             name=_obj_get(tool, "name", ""),
                             description=_obj_get(tool, "description", ""),
                             schema=_obj_get(tool, "inputSchema", {}) or _obj_get(tool, "input_schema", {}) or {},
-                            read_only_hint=bool(_obj_get(tool, "readOnlyHint", False) or _obj_get(tool, "read_only_hint", False)),
+                            read_only_hint=_hint_bool(tool, annotations, "readOnlyHint", "read_only_hint"),
+                            destructive_hint=_hint_bool(tool, annotations, "destructiveHint", "destructive_hint"),
+                            open_world_hint=_hint_bool(tool, annotations, "openWorldHint", "open_world_hint"),
+                            search_hint=_meta_str(meta, "anthropic/searchHint"),
+                            always_load=bool(_obj_get(meta, "anthropic/alwaysLoad", False)),
                         )
                     )
                 for resource in await _safe_list(client, "list_resources"):
@@ -206,6 +216,24 @@ def _obj_get(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def _hint_bool(tool: Any, annotations: Any, camel_name: str, snake_name: str) -> bool:
+    """从 tool 顶层或 annotations 中读取 MCP hint。"""
+    return bool(
+        _obj_get(tool, camel_name, False)
+        or _obj_get(tool, snake_name, False)
+        or _obj_get(annotations, camel_name, False)
+        or _obj_get(annotations, snake_name, False)
+    )
+
+
+def _meta_str(meta: Any, name: str) -> str:
+    """读取字符串型 MCP _meta 字段，并压缩空白避免污染工具列表。"""
+    value = _obj_get(meta, name, "")
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
 
 
 def _to_plain(value: Any) -> Any:
