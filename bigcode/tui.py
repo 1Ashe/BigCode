@@ -76,3 +76,48 @@ class BigCodeTUI:
         """输出 /status 使用的键值列表。"""
         for key, value in rows.items():
             self.print(f"{key}: {value}")
+
+
+class BigCodeStreamRenderer:
+    """把 AgentEvent 流渲染成人类可读终端输出。"""
+
+    def __init__(self, ui: BigCodeTUI) -> None:
+        self.ui = ui
+        self._stream_open = False
+        self.assistant_text = ""
+
+    def handle(self, event: Any) -> None:
+        """消费单个 AgentEvent。"""
+        event_type = getattr(event, "event_type", "")
+        if event_type == "stream":
+            self.ui.stream_text(event.text)
+            self.assistant_text += event.text
+            self._stream_open = True
+            return
+        if event_type == "tool_started":
+            self._close_stream()
+            self.ui.tool_call(event.tool_name, event.tool_use_id)
+            return
+        if event_type == "tool_progress":
+            self._close_stream()
+            if event.progress:
+                self.ui.print(f"[progress] {event.tool_name}: {event.progress}")
+            return
+        if event_type == "tool_completed":
+            self._close_stream()
+            status = "failed" if event.is_error else "completed"
+            self.ui.print(f"[tool {status}] {event.tool_name} ({event.duration_ms} ms)")
+            return
+        if event_type == "error":
+            self._close_stream()
+            self.ui.error(event.message)
+            return
+        if event_type == "status":
+            return
+        if event_type == "turn_completed":
+            self._close_stream()
+
+    def _close_stream(self) -> None:
+        if self._stream_open:
+            self.ui.print()
+            self._stream_open = False

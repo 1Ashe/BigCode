@@ -11,7 +11,7 @@ import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from pydantic import ValidationError
 
@@ -53,30 +53,65 @@ class ToolRunner:
         """保存工具注册表，后续执行工具时按 name 从这里查找实现。"""
         self.registry = registry
 
-    async def run_tool_uses(self, tool_uses: list[ToolUse], ctx: ToolExecutionContext) -> list[ToolRunResult[Any]]:
+    async def run_tool_uses(self, tool_uses: list[ToolUse], ctx: ToolExecutionContext) -> AsyncIterator[Any]:
         """按顺序执行一批 tool_use，并把安全的只读工具合并并发运行。
 
         会修改状态的工具必须等前面的安全批次完成后再单独执行。
         """
         self._ensure_registry_context(ctx)
-        results: list[ToolRunResult[Any] | None] = [None] * len(tool_uses)
         safe_batch: list[tuple[int, ToolUse]] = []
 
-        async def flush_safe_batch() -> None:
+        async def flush_safe_batch() -> AsyncIterator[Any]:
             """执行当前累积的并发安全工具批次，并把结果放回原始顺序的位置。"""
             nonlocal safe_batch
             if not safe_batch:
                 return
             batch = safe_batch
             safe_batch = []
-            batch_results = await asyncio.gather(*(self.run_one(tool_use, ctx) for _, tool_use in batch))
-            for (idx, _), result in zip(batch, batch_results):
-                results[idx] = result
+            queues: list[asyncio.Queue[Any]] = [asyncio.Queue() for _ in batch]
+
+            async def pump(queue: asyncio.Queue[Any], tool_use: ToolUse) -> None:
+                try:
+                    async for event in self.run_one(tool_use, ctx):
+                        await queue.put(event)
+                finally:
+                    await queue.put(None)
+
+            tasks = [asyncio.create_task(pump(queue, tool_use)) for queue, (_, tool_use) in zip(queues, batch)]
+            active = set(range(len(queues)))
+            ordered_results: list[tuple[int, ToolRunResult[Any]]] = []
+            try:
+                while active:
+                    getters = {asyncio.create_task(queues[i].get()): i for i in active}
+                    done, pending = await asyncio.wait(getters, return_when=asyncio.FIRST_COMPLETED)
+                    for pending_task in pending:
+                        pending_task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    for done_task in done:
+                        queue_index = getters[done_task]
+                        event = done_task.result()
+                        if event is None:
+                            active.discard(queue_index)
+                            continue
+                        if isinstance(event, ToolRunResult):
+                            ordered_results.append((batch[queue_index][0], event))
+                            continue
+                        yield event
+                await asyncio.gather(*tasks)
+                for _, result in sorted(ordered_results, key=lambda item: item[0]):
+                    yield result
+            except Exception:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
         for idx, tool_use in enumerate(tool_uses):
             if ctx.abort_event.is_set():
-                await flush_safe_batch()
-                results[idx] = self._aborted_result(tool_use, ctx)
+                async for event in flush_safe_batch():
+                    yield event
+                for event in self._aborted_result(tool_use, ctx):
+                    yield event
                 continue
 
             # 只读、无状态副作用的工具可以暂存到 safe_batch 里并发执行。
@@ -84,60 +119,72 @@ class ToolRunner:
             if self._is_concurrency_safe(tool_use, ctx):
                 safe_batch.append((idx, tool_use))
                 continue
-            await flush_safe_batch()
-            results[idx] = await self.run_one(tool_use, ctx)
-        await flush_safe_batch()
-        return [result for result in results if result is not None]
+            async for event in flush_safe_batch():
+                yield event
+            async for event in self.run_one(tool_use, ctx):
+                yield event
+        async for event in flush_safe_batch():
+            yield event
 
-    async def run_one(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> ToolRunResult[Any]:
+    async def run_one(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> AsyncIterator[Any]:
         """执行单个工具调用的完整流程。
 
         阅读这个方法能看到工具系统的主链路：找工具、Pydantic 校验、hook、权限、call、截断和 PostToolUse。
         """
         self._ensure_registry_context(ctx)
         started = time.perf_counter()
-        self._emit_tool_started(tool_use, ctx)
+        from bigcode.agent.events import ToolStarted
+
+        yield ToolStarted(session_id=ctx.session_id, tool_use_id=tool_use.id, tool_name=tool_use.name)
 
         # 第一步：按工具名找到实现。模型可能幻觉出不存在的工具名，
         # 所以这里必须把未知工具转换成普通 ToolRunResult 错误。
         tool = self.registry.get(tool_use.name)
         if tool is None:
-            return self._finish(
+            for event in self._finish(
                 tool_use,
                 ctx,
                 started,
                 tool_use.name,
                 ToolRunResult(tool_use.id, tool_use.name, is_error=True, error_message=f"Unknown tool: {tool_use.name}"),
-            )
+            ):
+                yield event
+            return
         try:
             # 第二步：用工具自己的 Pydantic input_model 校验参数。
             # 校验后得到的是强类型对象，后面的权限和 call 都使用它。
             input_model = tool.input_model.model_validate(tool_use.input)
         except ValidationError as exc:
-            return self._finish(
+            for event in self._finish(
                 tool_use,
                 ctx,
                 started,
                 tool.name,
                 ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=f"Invalid input: {exc}"),
-            )
+            ):
+                yield event
+            return
         if not tool.is_enabled(ctx):
-            return self._finish(
+            for event in self._finish(
                 tool_use,
                 ctx,
                 started,
                 tool.name,
                 ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=f"Tool {tool.name} is disabled."),
-            )
+            ):
+                yield event
+            return
         validation = await tool.validate_input(input_model, ctx)
         if not validation.ok:
-            return self._finish(
+            for event in self._finish(
                 tool_use,
                 ctx,
                 started,
                 tool.name,
                 ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=validation.message),
-            )
+            ):
+                yield event
+            return
 
         hook_decision: PermissionDecision | None = None
         if ctx.hook_bus:
@@ -154,33 +201,39 @@ class ToolRunner:
                 ),
             )
             if agg.decision == "block":
-                return self._finish(
+                for event in self._finish(
                     tool_use,
                     ctx,
                     started,
                     tool.name,
                     ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=agg.reason or "Blocked by hook."),
-                )
+                ):
+                    yield event
+                return
             if agg.updated_input is not None and agg.updated_input != input_model.model_dump():
                 try:
                     input_model = tool.input_model.model_validate(agg.updated_input)
                 except ValidationError as exc:
-                    return self._finish(
+                    for event in self._finish(
                         tool_use,
                         ctx,
                         started,
                         tool.name,
                         ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=f"Hook produced invalid input: {exc}"),
-                    )
+                    ):
+                        yield event
+                    return
                 validation = await tool.validate_input(input_model, ctx)
                 if not validation.ok:
-                    return self._finish(
+                    for event in self._finish(
                         tool_use,
                         ctx,
                         started,
                         tool.name,
                         ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=validation.message),
-                    )
+                    ):
+                        yield event
+                    return
             if agg.decision in {"approve", "ask"}:
                 behavior = "allow" if agg.decision == "approve" else "ask"
                 hook_decision = PermissionDecision(behavior=behavior, message=agg.reason, reason=agg.reason)
@@ -189,28 +242,47 @@ class ToolRunner:
         # 即使 hook 批准了，permissions.py 仍会套用硬拒绝。
         perm = await decide_permission(tool, input_model, ctx, hook_decision=hook_decision)
         if perm.behavior == "deny":
-            return self._finish(
+            for event in self._finish(
                 tool_use,
                 ctx,
                 started,
                 tool.name,
                 ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=perm.message or "Permission denied."),
-            )
+            ):
+                yield event
+            return
         if perm.behavior == "ask":
             approved = await self._ask_permission(tool, input_model, perm, ctx)
             if not approved:
-                return self._finish(
+                for event in self._finish(
                     tool_use,
                     ctx,
                     started,
                     tool.name,
                     ToolRunResult(tool_use.id, tool.name, is_error=True, error_message="permission denied by user."),
-                )
+                ):
+                    yield event
+                return
 
         try:
             # 第五步：真正执行工具。工具内部抛异常也会被包装成 ToolRunResult，
             # 这样模型能收到失败原因，而不是让整个 session 崩掉。
-            result = await tool.call(input_model, ctx)
+            def on_progress(progress: Any) -> None:
+                from bigcode.agent.events import ToolProgress
+
+                progress_events.append(
+                    ToolProgress(
+                        session_id=ctx.session_id,
+                        tool_use_id=tool_use.id,
+                        tool_name=tool.name,
+                        progress=progress,
+                    )
+                )
+
+            progress_events: list[Any] = []
+            result = await tool.call(input_model, ctx, on_progress=on_progress)
+            for progress_event in progress_events:
+                yield progress_event
             run_result = ToolRunResult(tool_use.id, tool.name, output=result)
         except Exception as exc:
             run_result = ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=str(exc))
@@ -237,19 +309,26 @@ class ToolRunner:
                     },
                 ),
             )
-        return self._finish(tool_use, ctx, started, tool.name, run_result)
+        for event in self._finish(tool_use, ctx, started, tool.name, run_result):
+            yield event
+        yield run_result
 
-    def _aborted_result(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> ToolRunResult[Any]:
+    def _aborted_result(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> list[Any]:
         """当会话收到 abort 信号时，为还没运行的工具生成一个统一的错误结果。"""
         started = time.perf_counter()
-        self._emit_tool_started(tool_use, ctx)
-        return self._finish(
-            tool_use,
-            ctx,
-            started,
-            tool_use.name,
+        from bigcode.agent.events import ToolStarted
+
+        return [
+            ToolStarted(session_id=ctx.session_id, tool_use_id=tool_use.id, tool_name=tool_use.name),
+            *self._finish(
+                tool_use,
+                ctx,
+                started,
+                tool_use.name,
+                ToolRunResult(tool_use.id, tool_use.name, is_error=True, error_message="Aborted."),
+            ),
             ToolRunResult(tool_use.id, tool_use.name, is_error=True, error_message="Aborted."),
-        )
+        ]
 
     def _finish(
         self,
@@ -258,40 +337,15 @@ class ToolRunner:
         started: float,
         tool_name: str,
         result: ToolRunResult[Any],
-    ) -> ToolRunResult[Any]:
+    ) -> list[Any]:
         """工具执行结束的统一收口点。
 
         它补充耗时事件，错误时额外发送 ErrorEvent，然后返回 ToolRunResult。
         """
         duration_ms = int((time.perf_counter() - started) * 1000)
-        self._emit_tool_completed(tool_use, ctx, tool_name, result, duration_ms)
-        if result.is_error:
-            self._emit_tool_error(tool_use, ctx, tool_name, result)
-        return result
+        from bigcode.agent.events import ErrorEvent, ToolCompleted
 
-    def _emit_tool_started(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> None:
-        """发送工具开始事件，给 JSONL 事件流或前端使用。"""
-        if not ctx.event_sink:
-            return
-        from bigcode.agent.events import ToolStarted
-
-        self._emit(ctx, ToolStarted(session_id=ctx.session_id, tool_use_id=tool_use.id, tool_name=tool_use.name))
-
-    def _emit_tool_completed(
-        self,
-        tool_use: ToolUse,
-        ctx: ToolExecutionContext,
-        tool_name: str,
-        result: ToolRunResult[Any],
-        duration_ms: int,
-    ) -> None:
-        """发送工具完成事件，metadata 里会标出结果是否被截断。"""
-        if not ctx.event_sink:
-            return
-        from bigcode.agent.events import ToolCompleted
-
-        self._emit(
-            ctx,
+        events: list[Any] = [
             ToolCompleted(
                 session_id=ctx.session_id,
                 tool_use_id=tool_use.id,
@@ -299,33 +353,18 @@ class ToolRunner:
                 is_error=result.is_error,
                 duration_ms=duration_ms,
                 metadata={"truncated": bool(result.metadata.get("truncated"))},
-            ),
-        )
-
-    def _emit_tool_error(self, tool_use: ToolUse, ctx: ToolExecutionContext, tool_name: str, result: ToolRunResult[Any]) -> None:
-        """发送工具错误事件，方便外部 UI 单独显示失败。"""
-        if not ctx.event_sink:
-            return
-        from bigcode.agent.events import ErrorEvent
-
-        self._emit(
-            ctx,
-            ErrorEvent(
-                session_id=ctx.session_id,
-                tool_use_id=tool_use.id,
-                tool_name=tool_name,
-                message=result.error_message or "Tool execution failed.",
-            ),
-        )
-
-    def _emit(self, ctx: ToolExecutionContext, event: Any) -> None:
-        """安全调用 event_sink；事件系统失败时不影响主流程。"""
-        if not ctx.event_sink:
-            return
-        try:
-            ctx.event_sink(event)
-        except Exception:
-            return
+            )
+        ]
+        if result.is_error:
+            events.append(
+                ErrorEvent(
+                    session_id=ctx.session_id,
+                    tool_use_id=tool_use.id,
+                    tool_name=tool_name,
+                    message=result.error_message or "Tool execution failed.",
+                )
+            )
+        return events
 
     async def _ask_permission(self, tool: Any, input_model: Any, decision: PermissionDecision, ctx: ToolExecutionContext) -> bool:
         """统一处理权限 ask。"""

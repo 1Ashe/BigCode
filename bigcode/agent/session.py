@@ -10,9 +10,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
-from bigcode.agent.events import EventSink, StatusEvent, StreamEvent, TurnCompleted
+from bigcode.agent.events import AgentEvent, StatusEvent, StreamEvent, TurnCompleted
 from bigcode.agent.snapshot import SessionSnapshot, load_session_snapshot, save_session_snapshot
 from bigcode.config.models import ResolvedModel, RuntimeConfig
 from bigcode.context.builder import ContextBuildDeps, build_context_for_api
@@ -51,11 +51,11 @@ from bigcode.subagents.definitions import AgentDefinition
 from bigcode.subagents.tasks import AgentRunResult, AgentTaskState, AgentTaskStore, render_agent_result, result_to_dict
 from bigcode.tasks import TaskStore
 from bigcode.tools.artifacts import ArtifactStore
-from bigcode.tools import ToolExecutionContext, ToolRegistry, ToolRunner, ToolUse, build_default_registry
+from bigcode.tools import ToolExecutionContext, ToolRegistry, ToolRunner, ToolRunResult, ToolUse, build_default_registry
 from bigcode.tools.mcp import register_mcp_tools_from_capabilities
 from bigcode.tools.permissions import ToolPermissionContext, PermissionRule
 from bigcode.tools.read_file_state import ReadFileState
-from bigcode.tui import BigCodeTUI
+from bigcode.tui import BigCodeStreamRenderer, BigCodeTUI
 from bigcode.utils.ids import new_id
 
 
@@ -83,7 +83,6 @@ class AgentSession:
         model_ref: str | None = None,
         registry: ToolRegistry | None = None,
         non_interactive: bool = False,
-        event_sink: EventSink | None = None,
         transcript_path: Path | None = None,
         persist_snapshot: bool = True,
         load_transcript: bool = True,
@@ -136,8 +135,8 @@ class AgentSession:
         self.skill_registry = load_skills(config.skill_roots)
         self.mcp_manager = McpClientManager(config.mcp_servers, enabled=config.mcp_enabled)
         self.non_interactive = non_interactive
-        self.event_sink = event_sink
-        self.ui = BigCodeTUI(enabled=event_sink is None)
+        self.ui = BigCodeTUI(enabled=True)
+        self._last_turn_result: AgentTurnResult | None = None
         self.hook_bus = HookBus()
         register_builtin_hooks(self.hook_bus)
 
@@ -205,7 +204,6 @@ class AgentSession:
             skill_registry=self.skill_registry,
             mcp_manager=self.mcp_manager,
             agent_session=self,
-            event_sink=self.event_sink,
             artifact_store=self.artifact_store,
             project_state_dir=self.config.project_state_dir,
             tool_registry=self.registry,
@@ -216,16 +214,16 @@ class AgentSession:
 
         它发送 session_started 事件，触发 SessionStart hook，并保存一次快照。
         """
-        self._emit_status("session_started", model=self.model_ref, cwd=str(self.config.cwd))
         await self.hook_bus.emit("SessionStart", HookInput("SessionStart", self.session_id, str(self.config.cwd), self.permission_context.mode))
         self._save_snapshot()
 
-    async def run_turn(self, prompt: str, *, max_steps: int = 20, display_stream: bool = False) -> AgentTurnResult:
-        """执行一次用户输入到模型回复的完整循环。
+    async def run_turn_stream(self, prompt: str, *, max_steps: int = 20) -> AsyncIterator[AgentEvent]:
+        """执行一次用户输入，并以 AgentEvent 流形式产出进度和结果。
 
         一次 turn 可能包含多步：模型先回复工具调用，工具执行结果再回填给模型，直到模型输出最终文本或达到 max_steps。
         """
-        self._emit_status("turn_started", max_steps=max_steps)
+        self._last_turn_result = None
+        yield StatusEvent(session_id=self.session_id, status="turn_started", metadata={"max_steps": max_steps})
         self.compact_state.turn_index += 1
         user_msg = UserMessage(prompt)
         self.messages.append(user_msg)
@@ -239,7 +237,7 @@ class AgentSession:
         tool_results: list[Any] = []
         for step in range(max_steps):
             self.compact_state.step_index = step
-            self._emit_status("model_request_started", step=step)
+            yield StatusEvent(session_id=self.session_id, status="model_request_started", metadata={"step": step})
             await self._sync_mcp_tools_to_registry()
 
             # 每一步请求模型前都重新构建上下文，因为上一轮工具结果、hook 附件、
@@ -269,17 +267,27 @@ class AgentSession:
             )
             self._append_compact_records(built.compact_result.records_to_append)
             if built.compact_result.blocked:
-                raise RuntimeError(
+                message = (
                     "Context is too large after compaction "
                     f"({built.compact_result.utilization_after:.1%} of the model context window)."
                 )
-            assistant = await self._request_model_stream(
+                yield StatusEvent(session_id=self.session_id, status="context_compaction_blocked", metadata={"step": step})
+                raise RuntimeError(message)
+
+            assistant: AssistantMessage | None = None
+            async for item in self._request_model_stream(
                 built.system_prompt,
                 built.api_messages,
                 self.registry.schemas_for_model(),
-                display_stream=display_stream,
-            )
-            self._emit_status("model_response_completed", step=step)
+            ):
+                if isinstance(item, AssistantMessage):
+                    assistant = item
+                else:
+                    yield item
+            if assistant is None:
+                raise RuntimeError("Model stream ended without an assistant message.")
+
+            yield StatusEvent(session_id=self.session_id, status="model_response_completed", metadata={"step": step})
             self.messages.append(assistant)
             self._append_transcript(assistant)
             text = text_from_blocks(assistant.content)
@@ -304,31 +312,61 @@ class AgentSession:
                     self.messages.append(reminder)
                     self._append_transcript(reminder)
                     continue
-                self._emit_status("turn_completed", stop_reason=assistant.stop_reason)
-                self._emit_turn_completed(assistant_text, assistant.stop_reason, len(tool_results))
-                return AgentTurnResult(assistant_text=assistant_text, tool_results=tool_results, stop_reason=assistant.stop_reason)
+                yield StatusEvent(session_id=self.session_id, status="turn_completed", metadata={"stop_reason": assistant.stop_reason})
+                self._last_turn_result = AgentTurnResult(
+                    assistant_text=assistant_text,
+                    tool_results=list(tool_results),
+                    stop_reason=assistant.stop_reason,
+                )
+                yield TurnCompleted(
+                    session_id=self.session_id,
+                    assistant_text=assistant_text,
+                    stop_reason=assistant.stop_reason,
+                    tool_result_count=len(tool_results),
+                )
+                return
             turn_tool_names.extend(t.name for t in tool_uses)
 
             # 模型请求工具时，不直接把结果返回给用户；先执行工具，再把 tool_result
             # 作为新的用户侧 meta 消息塞回 messages，让模型基于结果继续推理。
-            results = await self.runner.run_tool_uses(tool_uses, self.make_tool_context())
-            tool_results.extend(results)
-            for result in results:
+            step_results: list[ToolRunResult[Any]] = []
+            async for item in self.runner.run_tool_uses(tool_uses, self.make_tool_context()):
+                if isinstance(item, ToolRunResult):
+                    step_results.append(item)
+                else:
+                    yield item
+            tool_results.extend(step_results)
+            for result in step_results:
                 result_msg = tool_run_result_to_message(result)
                 self.messages.append(result_msg)
                 self._append_transcript(result_msg)
-        self._emit_status("turn_max_steps", max_steps=max_steps)
-        self._emit_turn_completed(assistant_text, "max_steps", len(tool_results))
-        return AgentTurnResult(assistant_text=assistant_text, tool_results=tool_results, stop_reason="max_steps")
+        yield StatusEvent(session_id=self.session_id, status="turn_max_steps", metadata={"max_steps": max_steps})
+        self._last_turn_result = AgentTurnResult(assistant_text=assistant_text, tool_results=list(tool_results), stop_reason="max_steps")
+        yield TurnCompleted(session_id=self.session_id, assistant_text=assistant_text, stop_reason="max_steps", tool_result_count=len(tool_results))
+
+    async def run_turn(self, prompt: str, *, max_steps: int = 20, display_stream: bool = False) -> AgentTurnResult:
+        """兼容包装：消费 run_turn_stream() 并返回最终结果。"""
+        renderer = BigCodeStreamRenderer(self.ui) if display_stream else None
+        assistant_text = ""
+        stop_reason: str | None = None
+        tool_result_count = 0
+        async for event in self.run_turn_stream(prompt, max_steps=max_steps):
+            if renderer:
+                renderer.handle(event)
+            if isinstance(event, TurnCompleted):
+                assistant_text = event.assistant_text
+                stop_reason = event.stop_reason
+                tool_result_count = event.tool_result_count
+        if self._last_turn_result is not None:
+            return self._last_turn_result
+        return AgentTurnResult(assistant_text=assistant_text, tool_results=[None] * tool_result_count, stop_reason=stop_reason)
 
     async def _request_model_stream(
         self,
         system_prompt: str,
         api_messages: list[Any],
         tool_schemas: list[dict[str, Any]],
-        *,
-        display_stream: bool = False,
-    ) -> AssistantMessage:
+    ) -> AsyncIterator[AgentEvent | AssistantMessage]:
         """请求模型流并收集成一条 AssistantMessage。"""
         text_parts: list[str] = []
         thinking_blocks: list[ThinkingBlock] = []
@@ -340,29 +378,27 @@ class AgentSession:
         async for event in client.stream(system_prompt, api_messages, tool_schemas):
             if isinstance(event, TextDelta):
                 text_parts.append(event.text)
-                self._emit_stream(event.text)
-                if display_stream:
-                    self.ui.stream_text(event.text)
+                yield StreamEvent(session_id=self.session_id, text=event.text)
             elif isinstance(event, ThinkingComplete):
                 thinking_blocks.append(ThinkingBlock(thinking=event.thinking, signature=event.signature))
             elif isinstance(event, ToolCallStart):
-                if display_stream:
-                    self.ui.tool_call(event.name, event.id)
+                yield StatusEvent(
+                    session_id=self.session_id,
+                    status="model_tool_call_started",
+                    metadata={"tool_use_id": event.id, "tool_name": event.name},
+                )
             elif isinstance(event, ToolCallComplete):
                 tool_blocks.append(ToolUseBlock(id=event.id, name=event.name, input=event.input))
             elif isinstance(event, StreamEnd):
                 stop_reason = event.stop_reason
                 usage = {"input_tokens": event.input_tokens, "output_tokens": event.output_tokens}
 
-        if display_stream and text_parts:
-            self.ui.print()
-
         content = []
         content.extend(thinking_blocks)
         if text_parts:
             content.append(TextBlock(text="".join(text_parts)))
         content.extend(tool_blocks)
-        return AssistantMessage(content, model=self.model.ref, stop_reason=stop_reason, usage=usage)
+        yield AssistantMessage(content, model=self.model.ref, stop_reason=stop_reason, usage=usage)
 
     async def run_subagent(
         self,
@@ -392,7 +428,6 @@ class AgentSession:
             model_ref=model_ref or definition.model or self.model_ref,
             registry=_registry_for_subagent(self.registry, definition, is_background=is_background),
             non_interactive=True,
-            event_sink=self.event_sink,
             transcript_path=sidechain_transcript_path,
             persist_snapshot=False,
             load_transcript=False,
@@ -602,12 +637,10 @@ class AgentSession:
                         break
                     continue
                 try:
-                    result = await self.run_turn(line)
+                    result = await self.run_turn(line, display_stream=True)
                 except Exception as exc:
                     self.ui.error(_format_exception(exc))
                     continue
-                if result.assistant_text:
-                    self.ui.print(result.assistant_text)
             return
         while True:
             try:
@@ -815,40 +848,6 @@ class AgentSession:
         except Exception:
             return "(invalid)"
 
-    def _emit_status(self, status: str, **metadata: Any) -> None:
-        """向 event_sink 发送普通状态事件；没有 event_sink 时直接忽略。"""
-        if not self.event_sink:
-            return
-        try:
-            self.event_sink(StatusEvent(session_id=self.session_id, status=status, metadata=metadata))
-        except Exception:
-            return
-
-    def _emit_stream(self, text: str) -> None:
-        """向 event_sink 发送模型文本增量。"""
-        if not self.event_sink or not text:
-            return
-        try:
-            self.event_sink(StreamEvent(session_id=self.session_id, text=text))
-        except Exception:
-            return
-
-    def _emit_turn_completed(self, assistant_text: str, stop_reason: str | None, tool_result_count: int) -> None:
-        """向 event_sink 发送单轮完成事件，供 JSONL 监听方消费。"""
-        if not self.event_sink:
-            return
-        try:
-            self.event_sink(
-                TurnCompleted(
-                    session_id=self.session_id,
-                    assistant_text=assistant_text,
-                    stop_reason=stop_reason,
-                    tool_result_count=tool_result_count,
-                )
-            )
-        except Exception:
-            return
-
     def record_loaded_skill(self, name: str) -> None:
         """记录本会话已经加载过的技能，并保存快照。"""
         if name not in self.loaded_skills:
@@ -896,7 +895,12 @@ class AgentSession:
             messages = [{"role": "user", "content": content}]
         else:
             messages = [ApiMessage(role="user", content=[{"type": "text", "text": content}])]
-        assistant = await self._request_model_stream(instruction, messages, [], display_stream=False)
+        assistant: AssistantMessage | None = None
+        async for item in self._request_model_stream(instruction, messages, []):
+            if isinstance(item, AssistantMessage):
+                assistant = item
+        if assistant is None:
+            return ""
         return text_from_blocks(assistant.content)
 
     def _save_snapshot(self) -> None:

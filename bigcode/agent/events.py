@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Union
+from typing import Any, Literal, Union
 
 
 def _now() -> float:
@@ -70,6 +70,21 @@ class ToolStarted:
 
 
 @dataclass(frozen=True)
+class ToolProgress:
+    """工具进度事件。
+
+    工具可以在长时间运行时产出进度数据；renderer/JSONL 消费者按需展示。
+    """
+    session_id: str
+    tool_use_id: str
+    tool_name: str
+    progress: Any
+    event_type: Literal["tool_progress"] = "tool_progress"
+    timestamp: float = field(default_factory=_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ToolCompleted:
     """工具完成事件。
 
@@ -100,5 +115,4 @@ class TurnCompleted:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-AgentEvent = Union[StreamEvent, StatusEvent, ErrorEvent, ToolStarted, ToolCompleted, TurnCompleted]
-EventSink = Callable[[AgentEvent], None]
+AgentEvent = Union[StreamEvent, StatusEvent, ErrorEvent, ToolStarted, ToolProgress, ToolCompleted, TurnCompleted]

@@ -97,7 +97,6 @@ class ToolExecutionContext:
     skill_registry: Any | None = None
     mcp_manager: Any | None = None
     agent_session: Any | None = None
-    event_sink: Any | None = None
     artifact_store: Any | None = None
     project_state_dir: Path | None = None
     tool_registry: Any | None = None

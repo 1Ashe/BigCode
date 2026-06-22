@@ -6,15 +6,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import inspect
+import json
 import sys
 import time
 from pathlib import Path
 
-from bigcode.agent import AgentSession, JsonlEventSink
+from bigcode.agent import AgentSession, serialize_agent_event
 from bigcode.agent.snapshot import SessionListItem, list_session_snapshots
 from bigcode.config import load_runtime_config
 from bigcode.diagnostics import build_doctor_report, render_doctor_report
+from bigcode.tui import BigCodeStreamRenderer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,28 +63,30 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--event-stream is currently supported only with `bigcode run`.")
 
     session_id = args.arg if args.command == "resume" else None
-    event_sink = JsonlEventSink(sys.stdout) if args.event_stream == "jsonl" else None
-
     # repl、resume、run 最终都会创建 AgentSession；区别主要是是否带 session_id，
     # 以及 run 只执行一次 prompt，repl 会进入循环。
-    session = AgentSession(config, session_id=session_id, model_ref=args.model_ref, non_interactive=args.non_interactive, event_sink=event_sink)
+    session = AgentSession(config, session_id=session_id, model_ref=args.model_ref, non_interactive=args.non_interactive)
     if args.command == "run":
         if not args.arg:
             raise SystemExit("bigcode run requires a prompt argument")
-        display_stream = args.event_stream == "off"
-        result = asyncio.run(_run_once(session, args.arg, display_stream=display_stream))
-        if result.assistant_text and args.event_stream == "off" and not display_stream:
-            print(result.assistant_text)
+        asyncio.run(_run_once(session, args.arg, event_stream=args.event_stream))
         return
     asyncio.run(session.run_repl())
 
 
-async def _run_once(session: AgentSession, prompt: str, *, display_stream: bool = False):
+async def _run_once(session: AgentSession, prompt: str, *, event_stream: str = "off"):
     """启动 session 并执行一次非交互式 prompt。"""
     await session.start()
-    if "display_stream" not in inspect.signature(session.run_turn).parameters:
-        return await session.run_turn(prompt)
-    return await session.run_turn(prompt, display_stream=display_stream)
+    if event_stream == "jsonl":
+        async for event in session.run_turn_stream(prompt):
+            sys.stdout.write(json.dumps(serialize_agent_event(event), ensure_ascii=False, sort_keys=True))
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        return None
+    renderer = BigCodeStreamRenderer(session.ui)
+    async for event in session.run_turn_stream(prompt):
+        renderer.handle(event)
+    return None
 
 
 def _render_resume_list(items: list[SessionListItem]) -> str:
