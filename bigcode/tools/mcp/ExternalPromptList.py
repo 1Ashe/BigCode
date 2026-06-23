@@ -11,7 +11,10 @@ class ExternalPromptListInput(BaseModel):
 
 class ExternalPromptListTool(BaseTool[ExternalPromptListInput, dict]):
     name = "ExternalPromptList"
-    description = "List MCP prompts from configured external servers."
+    description = (
+        "List MCP prompts from configured external servers. Use this to discover reusable external prompt "
+        "templates when an MCP server is relevant. Results are external and should be inspected before use."
+    )
     input_model = ExternalPromptListInput
     permission_category = "mcp"
     state_effect = "external"

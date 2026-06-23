@@ -14,7 +14,12 @@ class ToolSearchInput(BaseModel):
 class ToolSearchTool(BaseTool[ToolSearchInput, dict]):
     name = "Tool_Search"
     aliases = ("ToolSearch",)
-    description = "Search deferred tools and load their full schemas for future tool calls."
+    description = (
+        "Search deferred tools and load their full schemas for future tool calls. Use this when you need a "
+        "specialized or MCP tool that is mentioned in environment context but not currently callable. Query by "
+        "keywords, or use select:<tool_name>[,<tool_name>...] for exact names. After a match is loaded, call the "
+        "returned tool by its schema in a later step."
+    )
     input_model = ToolSearchInput
     permission_category = "read"
     state_effect = "none"

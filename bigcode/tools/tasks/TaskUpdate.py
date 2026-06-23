@@ -24,7 +24,11 @@ class TaskUpdateInput(BaseModel):
 
 class TaskUpdateTool(BaseTool[TaskUpdateInput, dict]):
     name = "TaskUpdate"
-    description = "Update a task in the current BigCode task list."
+    description = (
+        "Update an existing task in the current BigCode task list. Use this to change status, owner, subject, "
+        "details, or metadata after observed progress. Do not mark work complete until it has been verified. "
+        "This changes app task state."
+    )
     input_model = TaskUpdateInput
     permission_category = "state"
     state_effect = "app_state"

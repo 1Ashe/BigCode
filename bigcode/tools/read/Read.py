@@ -29,7 +29,12 @@ class ReadTool(BaseTool[ReadInput, dict]):
     """
     name = "Read"
     aliases = ("ReadFile",)
-    description = "Read a UTF-8 text file from the workspace."
+    description = (
+        "Read a UTF-8 text file from the workspace. Use this before editing or overwriting existing files, "
+        "and whenever you need exact file contents with line numbers. Provide file_path plus optional line "
+        "offset/limit for large files. This records a read snapshot used by Edit and Write to avoid overwriting "
+        "external changes; it is read-only but may expose sensitive file contents."
+    )
     input_model = ReadInput
     permission_category = "read"
     state_effect = "read_file_state"

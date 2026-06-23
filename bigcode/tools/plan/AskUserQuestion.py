@@ -39,7 +39,11 @@ class AskUserQuestionInput(BaseModel):
 
 class AskUserQuestionTool(BaseTool[AskUserQuestionInput, dict]):
     name = "AskUserQuestion"
-    description = "Ask the user one to three clarification questions."
+    description = (
+        "Ask the user one to three clarification questions when a material decision cannot be resolved from "
+        "repo inspection. Use concise questions with meaningful options and put the recommended option first. "
+        "In non-interactive sessions, this returns requires_answer instead of blocking."
+    )
     input_model = AskUserQuestionInput
     permission_category = "state"
     state_effect = "app_state"

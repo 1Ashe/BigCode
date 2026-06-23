@@ -15,7 +15,11 @@ class ExitPlanModeInput(BaseModel):
 
 class ExitPlanModeTool(BaseTool[ExitPlanModeInput, dict]):
     name = "ExitPlanMode"
-    description = "Submit the current plan for user approval and leave Plan Mode if approved."
+    description = (
+        "Submit the current plan for user approval and leave Plan Mode only if approved. Use this after the "
+        "plan file is decision-complete. In non-interactive sessions it returns requires_approval with the plan "
+        "instead of prompting."
+    )
     input_model = ExitPlanModeInput
     permission_category = "state"
     state_effect = "app_state"

@@ -15,7 +15,11 @@ class SkillLoadInput(BaseModel):
 
 class SkillLoadTool(BaseTool[SkillLoadInput, dict]):
     name = "SkillLoad"
-    description = "Load a registered skill's SKILL.md and resource list."
+    description = (
+        "Load a registered skill's SKILL.md and resource list. Use this when the environment or user indicates a "
+        "skill is relevant to the task. After loading, follow the skill instructions and use SkillResourceRead "
+        "for referenced resources. This reads external skill files and updates active skill context."
+    )
     input_model = SkillLoadInput
     permission_category = "skill"
     state_effect = "external"

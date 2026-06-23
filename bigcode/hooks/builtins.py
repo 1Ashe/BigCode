@@ -10,6 +10,69 @@ from .bus import HookBus, HookHandler
 from .models import HookInput, HookOutput
 
 
+_PLAN_MODE_FULL_REMINDER = """\
+Plan mode is active. The user indicated that they do not want broad implementation yet. Prefer read-only exploration and planning. Do not proactively edit non-plan workspace files.
+
+## Plan File Info:
+{plan_file_info}
+Build your plan incrementally by writing to or editing this file with the normal Write/Edit tools. Writes to this exact plan file are automatically allowed in Plan Mode. Other writes, commands, network calls, and agent actions use normal permission prompts; if you truly need a small supporting change during planning, request the tool call and the user can approve it.
+
+## Plan Workflow
+
+### Phase 1: Initial Understanding
+Goal: Understand the user's request and the relevant code.
+- Search and read the codebase before proposing changes.
+- Reuse existing functions, utilities, and patterns where possible.
+- Ask the user only for decisions that cannot be resolved from the repository.
+
+### Phase 2: Design
+Goal: Design the implementation approach.
+- Decide the exact behavior, touched subsystems, data flow, edge cases, and verification.
+- Keep scope tight; do not add unrelated refactors.
+
+### Phase 3: Review
+Goal: Ensure the plan aligns with the user's intent.
+- Re-read critical files if needed.
+- Check that the plan is decision-complete.
+
+### Phase 4: Final Plan
+Goal: Write the final plan to the plan file.
+- Include the recommended approach only.
+- Include important interface/type/API changes.
+- Include verification steps and assumptions."""
+
+_PLAN_MODE_SPARSE_REMINDER = (
+    "Plan mode still active. Plan file: {plan_path}. Prefer read-only planning; write the plan with Write/Edit. "
+    "Writes to the plan file are auto-allowed, other non-read actions use normal permission prompts."
+)
+
+_PLAN_REMINDER_INTERVAL = 5
+
+
+def build_plan_mode_reminder(plan_path: str, plan_exists: bool, iteration: int) -> str:
+    """Return the full or sparse Plan Mode reminder using mewcode's cadence."""
+
+    if plan_exists:
+        plan_file_info = (
+            f"Plan file: {plan_path}\n"
+            f"A plan file already exists at {plan_path}. Read it if needed and update it with Edit or Write."
+        )
+    else:
+        plan_file_info = (
+            f"Plan file: {plan_path}\n"
+            f"No plan file exists yet. Create it at {plan_path} with the Write tool."
+        )
+
+    if iteration == 1:
+        return _PLAN_MODE_FULL_REMINDER.format(plan_file_info=plan_file_info)
+
+    attachment_index = (iteration - 1) // _PLAN_REMINDER_INTERVAL
+    if attachment_index % _PLAN_REMINDER_INTERVAL == 0:
+        return _PLAN_MODE_FULL_REMINDER.format(plan_file_info=plan_file_info)
+
+    return _PLAN_MODE_SPARSE_REMINDER.format(plan_path=plan_path)
+
+
 class PlanModeContextHook(HookHandler):
     """计划模式上下文 Hook。
 
@@ -26,18 +89,17 @@ class PlanModeContextHook(HookHandler):
             return HookOutput()
         attachments = []
         if getattr(state, "active", False):
-            # active=True 表示当前仍在计划模式，每次构建上下文都要提醒模型只读。
             plan_file = getattr(state, "plan_file", None)
+            if plan_file:
+                iteration = int(input.payload.get("step_index") or input.payload.get("turn_index") or 1)
+                plan_exists = bool(input.payload.get("plan_file_exists"))
+                reminder = build_plan_mode_reminder(str(plan_file), plan_exists, iteration)
+            else:
+                reminder = "Plan mode is active. Prefer read-only planning; non-read actions use normal permission prompts."
             attachments.append(
                 Attachment(
                     type="plan_mode",
-                    text=(
-                        "You are in Plan Mode. Read and inspect as needed, but do not edit workspace files "
-                        f"or execute mutating commands. Write the final implementation plan to {plan_file}. "
-                        "Continue the iterative workflow: explore the codebase, ask user questions for unresolved "
-                        "decisions, and update the plan incrementally. End planning by calling AskUserQuestion for "
-                        "clarifications or ExitPlanMode for approval."
-                    ),
+                    text=reminder,
                     source=self.name,
                 )
             )
@@ -50,34 +112,6 @@ class PlanModeContextHook(HookHandler):
             )
             state.needs_exit_attachment = False
         return HookOutput(attachments=attachments)
-
-
-class PlanModeStopHook(HookHandler):
-    """计划模式停止保护 Hook。
-
-    如果模型在 Plan Mode 中没有用 AskUserQuestion 或 ExitPlanMode 收尾，它会要求继续当前 turn。
-    """
-    name = "PlanModeStopHook"
-    events = ("Stop",)
-    priority = 10
-
-    async def run(self, input: HookInput) -> HookOutput:
-        """在 Stop 事件中检查 Plan Mode 是否正确收尾。"""
-        state = input.payload.get("plan_mode_state")
-        if not state or not getattr(state, "active", False):
-            return HookOutput()
-        tool_names = set(input.payload.get("turn_tool_names") or [])
-        if tool_names.intersection({"AskUserQuestion", "ExitPlanMode"}):
-            return HookOutput()
-        return HookOutput(
-            decision="block",
-            continue_turn=True,
-            reason="Plan Mode turns must continue with AskUserQuestion or ExitPlanMode.",
-            additional_context=(
-                "Plan Mode is still active. Continue read-only exploration, update the plan, "
-                "or call AskUserQuestion / ExitPlanMode. Do not ask for plan approval in plain text."
-            ),
-        )
 
 
 class TaskReminderHook(HookHandler):
@@ -135,6 +169,5 @@ class CapabilityIndexHook(HookHandler):
 def register_builtin_hooks(bus: HookBus) -> None:
     """把所有内置 hook 注册到 HookBus。"""
     bus.register(PlanModeContextHook())
-    bus.register(PlanModeStopHook())
     bus.register(TaskReminderHook())
     bus.register(CapabilityIndexHook())

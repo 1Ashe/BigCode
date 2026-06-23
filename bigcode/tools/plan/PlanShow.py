@@ -6,7 +6,10 @@ from bigcode.tools.permission_helpers import allow_with_mode_policy
 
 class PlanShowTool(BaseTool[EmptyInput, dict]):
     name = "PlanShow"
-    description = "Show the current plan file path and content."
+    description = (
+        "Show the current session plan file path and content. Use this to review existing Plan Mode work before "
+        "editing or submitting it. It is read-only."
+    )
     input_model = EmptyInput
     permission_category = "state"
     state_effect = "app_state"

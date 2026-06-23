@@ -71,6 +71,9 @@ async def build_context_for_api(messages: list[MessageBase], deps: ContextBuildD
                 payload={
                     "message_count": len(messages),
                     "plan_mode_state": deps.plan_mode_state,
+                    "turn_index": deps.compact_state.turn_index,
+                    "step_index": deps.compact_state.step_index + 1,
+                    "plan_file_exists": _plan_file_exists(deps.plan_mode_state),
                     "task_store": deps.task_store,
                     "task_list_id": deps.task_list_id,
                     "capabilities": deps.capabilities,
@@ -123,3 +126,15 @@ async def build_context_for_api(messages: list[MessageBase], deps: ContextBuildD
     # 最后一步才把内部消息转 API 格式，这样前面的 hook/compact 都能使用内部结构。
     api_messages = normalize_messages_for_api(deps.system_prompt, context_messages, protocol=deps.protocol)
     return ContextBuildResult(deps.system_prompt, context_messages, api_messages, compact_result, attachments)
+
+
+def _plan_file_exists(state: object | None) -> bool:
+    plan_file = getattr(state, "plan_file", None)
+    if not plan_file:
+        return False
+    try:
+        from pathlib import Path
+
+        return Path(str(plan_file)).exists()
+    except OSError:
+        return False

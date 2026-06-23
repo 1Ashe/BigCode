@@ -7,7 +7,11 @@ from bigcode.tools.permission_helpers import allow_with_mode_policy
 
 class EnterPlanModeTool(BaseTool[EmptyInput, dict]):
     name = "EnterPlanMode"
-    description = "Enter read-only Plan Mode and create the current plan file."
+    description = (
+        "Enter read-only Plan Mode and create or select the current session plan file. Use this when the user "
+        "asks to plan before implementation. After entering, inspect freely and write the plan with the normal "
+        "Write/Edit tools at the provided plan_file path. Non-plan writes use normal permission prompts."
+    )
     input_model = EmptyInput
     permission_category = "state"
     state_effect = "app_state"
@@ -38,6 +42,7 @@ class EnterPlanModeTool(BaseTool[EmptyInput, dict]):
         ctx.permission_context.mode = "plan"
         ctx.plan_state.active = True
         path = ctx.plan_store.get_path(ctx.session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
         ctx.plan_state.plan_file = str(path)
         ctx.plan_state.plan_slug = path.stem
         if ctx.hook_bus:

@@ -16,7 +16,11 @@ class SkillResourceReadInput(BaseModel):
 
 class SkillResourceReadTool(BaseTool[SkillResourceReadInput, dict]):
     name = "SkillResourceRead"
-    description = "Read a resource file from a registered skill."
+    description = (
+        "Read a resource file from a registered skill. Use this only after SkillLoad or skill instructions point "
+        "to a specific resource. Provide the skill name and resource path; the tool enforces skill resource "
+        "boundaries but may expose external instructional content."
+    )
     input_model = SkillResourceReadInput
     permission_category = "skill"
     state_effect = "external"

@@ -15,7 +15,11 @@ class TaskStopInput(BaseModel):
 
 class TaskStopTool(BaseTool[TaskStopInput, dict]):
     name = "TaskStop"
-    description = "Cancel an in-process background subAgent task if it is still running."
+    description = (
+        "Cancel an in-process background subAgent task if it is still running. Use this when delegated work is no "
+        "longer needed, is using the wrong scope, or must be stopped before a new approach. This changes app "
+        "sub-agent state."
+    )
     input_model = TaskStopInput
     permission_category = "state"
     state_effect = "app_state"

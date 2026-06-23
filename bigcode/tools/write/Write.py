@@ -26,7 +26,12 @@ class WriteTool(BaseTool[WriteInput, dict]):
     ToolRunner 会先校验 input_model 和权限，再调用这个类的 call() 方法执行真正逻辑。
     """
     name = "Write"
-    description = "Create or overwrite a workspace text file."
+    description = (
+        "Create a new workspace text file or replace an entire existing text file. Use this when generating a "
+        "whole file is clearer than a small string replacement. For existing files, read the file first so the "
+        "snapshot guard can detect external changes. The target must stay inside the workspace and may require "
+        "write permission."
+    )
     input_model = WriteInput
     permission_category = "write"
     state_effect = "workspace_write"

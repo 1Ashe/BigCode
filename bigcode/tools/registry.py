@@ -156,7 +156,7 @@ class ToolRegistry:
         return [
             {
                 "name": tool.name,
-                "description": tool.description,
+                "description": _schema_description(self, tool),
                 "input_schema": tool.json_schema(),
             }
             for tool in self.list_tools()
@@ -180,7 +180,6 @@ def build_default_registry() -> ToolRegistry:
     from .plan.EnterPlanMode import EnterPlanModeTool
     from .plan.ExitPlanMode import ExitPlanModeTool
     from .plan.PlanShow import PlanShowTool
-    from .plan.WritePlan import WritePlanTool
     from .read.Read import ReadTool
     from .skills.SkillLoad import SkillLoadTool
     from .skills.SkillResourceRead import SkillResourceReadTool
@@ -219,7 +218,6 @@ def build_default_registry() -> ToolRegistry:
         TaskClaimTool(),
         TaskBlockTool(),
         EnterPlanModeTool(),
-        WritePlanTool(),
         PlanShowTool(),
         ExitPlanModeTool(),
         AskUserQuestionTool(),
@@ -306,3 +304,21 @@ def _dedupe_tools(tools: list[BaseTool]) -> list[BaseTool]:
         seen.add(id(tool))
         out.append(tool)
     return out
+
+
+def _schema_description(registry: ToolRegistry, tool: BaseTool) -> str:
+    """Return a detailed model-facing description with stable operational metadata."""
+    parts = [" ".join((tool.description or "").split())]
+    aliases = ", ".join(getattr(tool, "aliases", ()) or ())
+    metadata = [
+        f"permission_category={tool.permission_category}",
+        f"state_effect={tool.state_effect}",
+    ]
+    if aliases:
+        metadata.append(f"aliases={aliases}")
+    if registry.is_deferred(tool):
+        metadata.append("deferred=true; load with Tool_Search before use")
+    elif getattr(tool, "always_load", False):
+        metadata.append("always_loaded=true")
+    parts.append("Metadata: " + "; ".join(metadata) + ".")
+    return "\n\n".join(part for part in parts if part)

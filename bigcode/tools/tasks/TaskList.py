@@ -17,7 +17,10 @@ class TaskListInput(BaseModel):
 
 class TaskListTool(BaseTool[TaskListInput, dict]):
     name = "TaskList"
-    description = "List tasks in the current BigCode task list."
+    description = (
+        "List tasks in the current BigCode task list. Use this to recover outstanding work, choose the next "
+        "task, or inspect task status before updating. It reads app task state."
+    )
     input_model = TaskListInput
     permission_category = "state"
     state_effect = "app_state"

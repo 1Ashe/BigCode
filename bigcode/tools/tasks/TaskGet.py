@@ -14,7 +14,10 @@ class TaskGetInput(BaseModel):
 
 class TaskGetTool(BaseTool[TaskGetInput, dict]):
     name = "TaskGet"
-    description = "Get one task from the current BigCode task list."
+    description = (
+        "Get one task from the current BigCode task list by id. Use this when you need exact details, metadata, "
+        "dependencies, or current status before acting. It reads app task state."
+    )
     input_model = TaskGetInput
     permission_category = "state"
     state_effect = "app_state"

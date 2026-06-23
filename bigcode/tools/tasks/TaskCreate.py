@@ -18,7 +18,11 @@ class TaskCreateInput(BaseModel):
 
 class TaskCreateTool(BaseTool[TaskCreateInput, dict]):
     name = "TaskCreate"
-    description = "Create a task in the current BigCode task list."
+    description = (
+        "Create a task in the current BigCode task list. Use this to track multi-step implementation work, "
+        "delegation, or verification items that should survive across turns. Provide a clear subject and any "
+        "metadata required by the task workflow. This changes app task state."
+    )
     input_model = TaskCreateInput
     permission_category = "state"
     state_effect = "app_state"

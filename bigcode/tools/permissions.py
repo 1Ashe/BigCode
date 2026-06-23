@@ -101,25 +101,6 @@ MUTATING_BASH = {
     "git",
 }
 COMPLEX_SHELL_RE = re.compile(r"(&&|\|\||;|\||>|<|\$\(|`|\n|\*)")
-PLAN_ALLOWED_TOOLS = {
-    "Read",
-    "Glob",
-    "Grep",
-    "PlanShow",
-    "WritePlan",
-    "ExitPlanMode",
-    "AskUserQuestion",
-    "TaskList",
-    "TaskGet",
-    "TaskOutput",
-    "SkillLoad",
-    "SkillResourceRead",
-    "Tool_Search",
-    "ExternalResourceList",
-    "ExternalResourceRead",
-    "ExternalPromptList",
-    "ExternalPromptGet",
-}
 READ_ONLY_SANDBOX_TOOLS = {
     "Read",
     "Glob",
@@ -247,17 +228,13 @@ def check_content_policy(target: PermissionTarget, ctx: ToolExecutionContext) ->
 def check_mode_policy_for_target(target: PermissionTarget, ctx: ToolExecutionContext, tool: BaseTool | None = None) -> PermissionDecision | None:
     """工具返回精确 allow 前可调用的模式/状态收紧检查。"""
 
-    if ctx.permission_context.mode == "plan":
-        if target.tool_name not in PLAN_ALLOWED_TOOLS:
-            if _read_only_allowed_in_restricted_mode(tool, target, ctx):
-                return None
-            return PermissionDecision(
-                "deny",
-                message=f"{target.tool_name} is not allowed in Plan Mode.",
-                reason="plan-mode",
-                updated_input=target.raw,
-                decision_reason={"type": "mode"},
-            )
+    if ctx.permission_context.mode == "plan" and _is_plan_file_write(target, ctx):
+        return PermissionDecision(
+            "allow",
+            message="Plan file write allowed in Plan Mode.",
+            updated_input=target.raw,
+            decision_reason={"type": "mode"},
+        )
     return _check_sandbox_profile_target(target, ctx, tool)
 
 
@@ -377,13 +354,25 @@ def _apply_generic_defaults(
 
     mode = ctx.permission_context.mode
     if mode == "plan":
-        if tool.name not in PLAN_ALLOWED_TOOLS:
-            if _read_only_allowed_in_restricted_mode(tool, target, ctx):
-                return PermissionDecision("allow", message="Read-only tool allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
-            return PermissionDecision("deny", message=f"{tool.name} is not allowed in Plan Mode.", reason="plan-mode", updated_input=target.raw, decision_reason={"type": "mode"})
-        if decision.behavior == "passthrough":
-            return PermissionDecision("allow", message="Allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
-        return decision
+        if _is_plan_file_write(target, ctx):
+            return PermissionDecision("allow", message="Plan file write allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
+        if target.category == "read":
+            if target.path is None:
+                return PermissionDecision("allow", message="Read allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
+            resolved = _resolve_existing_or_parent(ctx.cwd, target.path)
+            behavior = "allow" if _inside_any(resolved, ctx.workspace_roots) else "ask"
+            return PermissionDecision(behavior, message="Read permission required.", updated_input=target.raw, decision_reason={"type": "mode"})
+        if target.category == "skill":
+            return PermissionDecision("allow", message="Registered skill access allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
+        if target.category == "state":
+            return PermissionDecision("allow", message="App state tool allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
+        if target.category == "bash" and target.command and classify_bash(target.command) == "read":
+            return PermissionDecision("allow", message="Read-only Bash allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
+        if _read_only_allowed_in_restricted_mode(tool, target, ctx):
+            return PermissionDecision("allow", message="Read-only tool allowed in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
+        if target.category in {"write", "edit", "delete", "bash", "network", "agent", "mcp"}:
+            return PermissionDecision("ask", message=f"{tool.name} requires permission in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
+        return PermissionDecision("ask", message=f"{tool.name} requires permission in Plan Mode.", updated_input=target.raw, decision_reason={"type": "mode"})
 
     if mode == "acceptEdits" and target.category in {"write", "edit"}:
         if target.path is not None:
@@ -451,6 +440,23 @@ def _check_sandbox_profile_target(target: PermissionTarget, ctx: ToolExecutionCo
                 decision_reason={"type": "safetyCheck"},
             )
     return None
+
+
+def _is_plan_file_write(target: PermissionTarget, ctx: ToolExecutionContext) -> bool:
+    """Return True when Write/Edit targets the active Plan Mode file."""
+
+    if target.tool_name not in {"Write", "Edit"} or target.path is None:
+        return False
+    state = getattr(ctx, "plan_state", None)
+    plan_file = getattr(state, "plan_file", None)
+    if not plan_file:
+        return False
+    try:
+        target_resolved = _resolve_existing_or_parent(ctx.cwd, target.path)
+        plan_resolved = _resolve_existing_or_parent(ctx.cwd, Path(plan_file))
+    except Exception:
+        return False
+    return target_resolved == plan_resolved
 
 
 def _read_only_allowed_in_restricted_mode(tool: BaseTool | None, target: PermissionTarget, ctx: ToolExecutionContext) -> bool:

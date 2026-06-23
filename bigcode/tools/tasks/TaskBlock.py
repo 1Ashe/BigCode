@@ -17,7 +17,10 @@ class TaskBlockInput(BaseModel):
 class TaskBlockTool(BaseTool[TaskBlockInput, dict]):
     name = "TaskBlock"
     aliases = ("TaskBlockTask",)
-    description = "Record that one task blocks another task."
+    description = (
+        "Record that one task blocks another task. Use this to model dependencies so blocked work is not claimed "
+        "or reported ready too early. This changes app task state."
+    )
     input_model = TaskBlockInput
     permission_category = "state"
     state_effect = "app_state"

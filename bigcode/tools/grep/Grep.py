@@ -30,7 +30,11 @@ class GrepTool(BaseTool[GrepInput, dict]):
     ToolRunner 会先校验 input_model 和权限，再调用这个类的 call() 方法执行真正逻辑。
     """
     name = "Grep"
-    description = "Search text files inside the workspace."
+    description = (
+        "Search workspace text files for a string or regular expression. Use this to locate symbols, settings, "
+        "error messages, TODOs, or references before opening files. Provide pattern, optional path, optional file "
+        "glob, and regex=false for literal matching. It is read-only and returns matching file, line, and text."
+    )
     input_model = GrepInput
     permission_category = "read"
     state_effect = "none"

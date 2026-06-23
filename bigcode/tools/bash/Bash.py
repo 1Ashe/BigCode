@@ -27,7 +27,12 @@ class BashTool(BaseTool[BashInput, dict]):
     ToolRunner 会先校验 input_model 和权限，再调用这个类的 call() 方法执行真正逻辑。
     """
     name = "Bash"
-    description = "Run a shell command in the workspace. Mutating commands require permission."
+    description = (
+        "Run a shell command from the workspace. Use this for tests, builds, package managers, git inspection, "
+        "or system commands that dedicated tools cannot perform. Prefer Read/Glob/Grep/Edit/Write for file "
+        "operations. Include a focused command and timeout. Read-only commands can run directly; mutating, "
+        "unknown, or risky commands may require permission, and dangerous commands are denied."
+    )
     input_model = BashInput
     permission_category = "bash"
     state_effect = "external"

@@ -24,7 +24,11 @@ class WebSearchTool(BaseTool[WebSearchInput, dict]):
     ToolRunner 会先校验 input_model 和权限，再调用这个类的 call() 方法执行真正逻辑。
     """
     name = "WebSearch"
-    description = "Placeholder web search tool. Configure an MCP/search backend for real search."
+    description = (
+        "Search the web when a configured backend is available. Use this only for current or external facts that "
+        "cannot be answered from the workspace. This placeholder reports configuration guidance unless a real "
+        "search backend is connected; consider Tool_Search for deferred MCP search tools."
+    )
     input_model = WebSearchInput
     permission_category = "network"
     state_effect = "external"

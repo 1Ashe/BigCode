@@ -11,7 +11,10 @@ class ExternalResourceListInput(BaseModel):
 
 class ExternalResourceListTool(BaseTool[ExternalResourceListInput, dict]):
     name = "ExternalResourceList"
-    description = "List MCP resources from configured external servers."
+    description = (
+        "List MCP resources from configured external servers. Use this to discover external context exposed by "
+        "MCP before reading a specific resource. Results are external and may be untrusted."
+    )
     input_model = ExternalResourceListInput
     permission_category = "mcp"
     state_effect = "external"

@@ -16,7 +16,10 @@ class TaskOutputInput(BaseModel):
 
 class TaskOutputTool(BaseTool[TaskOutputInput, dict]):
     name = "TaskOutput"
-    description = "List background subAgent tasks or read one task's persisted status and output."
+    description = (
+        "List background subAgent tasks or read one task's persisted status and output. Use this after Agent "
+        "starts a background task to check progress, retrieve final results, or inspect failures. It is read-only."
+    )
     input_model = TaskOutputInput
     permission_category = "state"
     state_effect = "none"

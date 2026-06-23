@@ -17,7 +17,11 @@ class TaskClaimInput(BaseModel):
 
 class TaskClaimTool(BaseTool[TaskClaimInput, dict]):
     name = "TaskClaim"
-    description = "Atomically claim a pending, unblocked task for an owner."
+    description = (
+        "Atomically claim a pending, unblocked task for an owner. Use this when multiple agents or workers may "
+        "pull from the same task list and you need exclusive ownership before starting work. This changes app "
+        "task state."
+    )
     input_model = TaskClaimInput
     permission_category = "state"
     state_effect = "app_state"

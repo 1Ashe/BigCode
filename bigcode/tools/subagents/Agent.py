@@ -18,7 +18,12 @@ class AgentToolInput(BaseModel):
 
 class AgentTool(BaseTool[AgentToolInput, dict]):
     name = "Agent"
-    description = "Run a built-in subAgent synchronously or as an in-process background task."
+    description = (
+        "Run a built-in subAgent synchronously or as an in-process background task. Use this to delegate complex "
+        "exploration, planning, implementation, or verification when a focused sub-agent can work independently. "
+        "Provide the subagent_type and a complete prompt with scope, constraints, and expected output. Background "
+        "runs return an id; use TaskOutput to inspect results."
+    )
     input_model = AgentToolInput
     permission_category = "agent"
     state_effect = "external"

@@ -26,7 +26,11 @@ class GlobTool(BaseTool[GlobInput, dict]):
     ToolRunner 会先校验 input_model 和权限，再调用这个类的 call() 方法执行真正逻辑。
     """
     name = "Glob"
-    description = "Find files by glob pattern inside the workspace."
+    description = (
+        "Find workspace files by glob pattern. Use this to discover filenames or narrow candidate paths before "
+        "reading content. Provide pattern and optional base path directory. It returns regular files only, caps "
+        "results, and is read-only."
+    )
     input_model = GlobInput
     permission_category = "read"
     state_effect = "none"

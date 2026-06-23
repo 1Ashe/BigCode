@@ -28,7 +28,12 @@ class EditTool(BaseTool[EditInput, dict]):
     ToolRunner 会先校验 input_model 和权限，再调用这个类的 call() 方法执行真正逻辑。
     """
     name = "Edit"
-    description = "Replace text in a file that has already been read."
+    description = (
+        "Replace text in an existing workspace file that has already been read. Use this for precise, minimal "
+        "edits when you know the exact old_string. The old_string must match uniquely unless replace_all=true. "
+        "The tool validates the file has not changed since the last Read snapshot and writes only inside the "
+        "workspace; it may require edit permission."
+    )
     input_model = EditInput
     permission_category = "edit"
     state_effect = "workspace_write"

@@ -28,7 +28,7 @@ from bigcode.context.messages import (
     text_from_blocks,
 )
 from bigcode.context.normalizer import tool_run_result_to_message
-from bigcode.context.system_prompt import build_system_prompt
+from bigcode.context.system_prompt import build_environment_context, build_system_prompt
 from bigcode.context.transcript import Transcript
 from bigcode.hooks.builtins import register_builtin_hooks
 from bigcode.hooks.models import HookInput
@@ -149,13 +149,28 @@ class AgentSession:
         else:
             self.system_prompt = build_system_prompt(
                 cwd=self.config.cwd,
+                repo_root=self.config.repo_root,
                 tool_names=[tool.name for tool in self.registry.list_tools()],
                 instruction_paths=self.config.instruction_paths,
                 role_instruction=system_instruction,
+                permission_mode=self.permission_context.mode,
+                sandbox_profile=self.config.sandbox_profile,
             ).render()
             prompt_snapshot = SystemPromptSnapshotMessage(self.system_prompt)
             self.messages.append(prompt_snapshot)
             self.transcript.append(prompt_snapshot)
+            environment = UserMessage(
+                build_environment_context(
+                    config=self.config,
+                    registry=self.registry,
+                    model_ref=self.model_ref,
+                    capabilities=self._capabilities(),
+                ),
+                is_meta=True,
+                origin="environment",
+            )
+            self.messages.append(environment)
+            self.transcript.append(environment)
 
     @property
     def model(self) -> ResolvedModel:
@@ -910,7 +925,6 @@ def _registry_for_subagent(parent: ToolRegistry, definition: AgentDefinition, *,
                 "Agent",
                 "Edit",
                 "EnterPlanMode",
-                "WritePlan",
                 "ExitPlanMode",
                 "AskUserQuestion",
                 "TaskCreate",
