@@ -146,9 +146,22 @@ class ToolRunner:
                 ctx,
                 started,
                 tool_use.name,
-                ToolRunResult(tool_use.id, tool_use.name, is_error=True, error_message=f"Unknown tool: {tool_use.name}"),
+                ToolRunResult(
+                    tool_use.id,
+                    tool_use.name,
+                    is_error=True,
+                    error_message=f"Unknown tool: {tool_use.name}",
+                    metadata={"unknown_tool": True},
+                ),
             ):
                 yield event
+            yield ToolRunResult(
+                tool_use.id,
+                tool_use.name,
+                is_error=True,
+                error_message=f"Unknown tool: {tool_use.name}",
+                metadata={"unknown_tool": True},
+            )
             return
         try:
             # 第二步：用工具自己的 Pydantic input_model 校验参数。
@@ -252,7 +265,30 @@ class ToolRunner:
                 yield event
             return
         if perm.behavior == "ask":
-            approved = await self._ask_permission(tool, input_model, perm, ctx)
+            from bigcode.agent.events import PermissionRequested, PermissionResolved
+
+            approval_lines = _permission_approval_lines(tool.name, input_model.model_dump(), ctx)
+            summary = approval_lines[0] if len(approval_lines) == 1 else _permission_summary(tool.name, input_model.model_dump(), ctx)
+            yield PermissionRequested(
+                session_id=ctx.session_id,
+                tool_use_id=tool_use.id,
+                tool_name=tool.name,
+                summary=summary,
+                metadata={
+                    "message": perm.message,
+                    "reason": perm.reason,
+                    "decision_reason": perm.decision_reason,
+                    "approval_lines": approval_lines,
+                },
+            )
+            approved, source = await self._ask_permission(tool, input_model, perm, ctx, approval_lines=approval_lines)
+            yield PermissionResolved(
+                session_id=ctx.session_id,
+                tool_use_id=tool_use.id,
+                tool_name=tool.name,
+                approved=approved,
+                source=source,
+            )
             if not approved:
                 for event in self._finish(
                     tool_use,
@@ -366,12 +402,20 @@ class ToolRunner:
             )
         return events
 
-    async def _ask_permission(self, tool: Any, input_model: Any, decision: PermissionDecision, ctx: ToolExecutionContext) -> bool:
+    async def _ask_permission(
+        self,
+        tool: Any,
+        input_model: Any,
+        decision: PermissionDecision,
+        ctx: ToolExecutionContext,
+        *,
+        approval_lines: list[str] | None = None,
+    ) -> tuple[bool, str]:
         """统一处理权限 ask。"""
         if ctx.permission_context.mode == "dontAsk" or ctx.permission_context.should_avoid_permission_prompts:
-            return False
+            return False, "mode"
         if ctx.permission_context.mode == "auto":
-            return _auto_approve_permission(tool, input_model, decision, ctx)
+            return _auto_approve_permission(tool, input_model, decision, ctx), "mode"
         if ctx.is_non_interactive_session:
             if ctx.hook_bus:
                 agg = await ctx.hook_bus.emit(
@@ -395,12 +439,16 @@ class ToolRunner:
                     ),
                 )
                 if agg.decision == "approve":
-                    return True
+                    return True, "hook"
                 if agg.decision == "block":
-                    return False
-            return False
-        prompt = _format_permission_prompt(tool.name, decision.message, input_model, ctx)
-        return await asyncio.to_thread(_read_yes_no, prompt)
+                    return False, "hook"
+            return False, "non_interactive"
+        lines = approval_lines or _permission_approval_lines(tool.name, input_model.model_dump(), ctx)
+        for line in lines:
+            approved = await _approve_line(line, ctx)
+            if not approved:
+                return False, "user"
+        return True, "user"
 
     def _is_concurrency_safe(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> bool:
         """判断某个工具调用能否和其它工具并发运行。
@@ -473,12 +521,32 @@ class ToolRunner:
                 ctx.agent_session.record_last_verification(command=command, exit_code=exit_code)
 
 
+async def _approve_line(line: str, ctx: ToolExecutionContext) -> bool:
+    """审批单行动作；交互式 UI 可通过 context 注入 transient prompt。"""
+    if ctx.approval_cache is not None and line in ctx.approval_cache:
+        return ctx.approval_cache[line]
+    if ctx.approval_callback is not None:
+        approved = await ctx.approval_callback(line)
+    else:
+        approved = await asyncio.to_thread(_read_yes_no, f"{line} [y/N] ")
+    if ctx.approval_cache is not None and approved:
+        ctx.approval_cache[line] = approved
+    return approved
+
+
 def _read_yes_no(prompt: str) -> bool:
-    """读取 y/yes 风格的确认输入；EOF 时按拒绝处理。"""
-    try:
-        return input(prompt).strip().lower() in {"y", "yes"}
-    except EOFError:
-        return False
+    """读取明确 yes/no 的确认输入；EOF 或空回车按拒绝处理。"""
+    from bigcode.ui.prompt import INVALID_APPROVAL_PROMPT, parse_yes_no
+
+    while True:
+        try:
+            value = input(prompt)
+        except EOFError:
+            return False
+        parsed = parse_yes_no(value)
+        if parsed is not None:
+            return parsed
+        prompt = INVALID_APPROVAL_PROMPT
 
 
 _SENSITIVE_FIELD_RE = re.compile(r"(api[_-]?key|token|password|secret|authorization|credential)", re.IGNORECASE)
@@ -492,7 +560,36 @@ def _format_permission_prompt(tool_name: str, message: str, input_model: Any, ct
     """
     data = input_model.model_dump() if hasattr(input_model, "model_dump") else {}
     summary = _permission_summary(tool_name, data, ctx)
-    return f"\n{summary}，是否允许？[y/N] "
+    if message:
+        return f"\n{summary}\n{message}\nApprove? Type yes/y to allow, no/n or Enter to deny: "
+    return f"\n{summary}\nApprove? Type yes/y to allow, no/n or Enter to deny: "
+
+
+def _permission_approval_lines(tool_name: str, data: dict[str, Any], ctx: ToolExecutionContext) -> list[str]:
+    """生成逐条、单行审批提示。"""
+    if tool_name == "Bash":
+        command = str(data.get("command") or "").strip()
+        parsed = _split_shell_command(command)
+        if command and not parsed.is_complex and parsed.segments:
+            return [f"Approve Bash: {_simple_bash_action(segment, ctx)} ?" for segment in parsed.segments]
+        return [f"Approve Bash: {_inline_preview(command or '(empty)')} ?"]
+    if tool_name == "Write":
+        return [f"Approve Write: {_short_path(data.get('file_path'), ctx)} ?"]
+    if tool_name == "Edit":
+        return [f"Approve Edit: {_short_path(data.get('file_path'), ctx)} ?"]
+    if tool_name == "WebFetch":
+        return [f"Approve WebFetch: {_inline_preview(data.get('url') or '(missing)')} ?"]
+    if tool_name == "WebSearch":
+        return [f"Approve WebSearch: {_inline_preview(data.get('query') or '(empty)')} ?"]
+    if tool_name == "Agent":
+        subagent_type = data.get("subagent_type") or "general-purpose"
+        return [f"Approve Agent: {subagent_type} ?"]
+    path_value = data.get("file_path") or data.get("path")
+    if path_value:
+        return [f"Approve {tool_name}: {_short_path(path_value, ctx)} ?"]
+    if data.get("command"):
+        return [f"Approve {tool_name}: {_inline_preview(data['command'])} ?"]
+    return [f"Approve {tool_name} ?"]
 
 
 def _auto_approve_permission(tool: Any, input_model: Any, decision: PermissionDecision, ctx: ToolExecutionContext) -> bool:

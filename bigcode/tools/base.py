@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Awaitable, Callable, Generic, Literal, TypeVar
 
 from pydantic import BaseModel
 
@@ -100,6 +100,8 @@ class ToolExecutionContext:
     artifact_store: Any | None = None
     project_state_dir: Path | None = None
     tool_registry: Any | None = None
+    approval_callback: Callable[[str], Awaitable[bool]] | None = None
+    approval_cache: dict[str, bool] | None = None
 
 
 class BaseTool(ABC, Generic[InputT, OutputT]):

@@ -15,7 +15,8 @@ from bigcode.agent import AgentSession, serialize_agent_event
 from bigcode.agent.snapshot import SessionListItem, list_session_snapshots
 from bigcode.config import load_runtime_config
 from bigcode.diagnostics import build_doctor_report, render_doctor_report
-from bigcode.tui import BigCodeStreamRenderer
+from bigcode.ui import BigCodeStreamRenderer, BigCodeTUI
+from bigcode.ui.repl import run_repl
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,7 +72,7 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit("bigcode run requires a prompt argument")
         asyncio.run(_run_once(session, args.arg, event_stream=args.event_stream))
         return
-    asyncio.run(session.run_repl())
+    asyncio.run(run_repl(session))
 
 
 async def _run_once(session: AgentSession, prompt: str, *, event_stream: str = "off"):
@@ -83,9 +84,13 @@ async def _run_once(session: AgentSession, prompt: str, *, event_stream: str = "
             sys.stdout.write("\n")
             sys.stdout.flush()
         return None
-    renderer = BigCodeStreamRenderer(session.ui)
-    async for event in session.run_turn_stream(prompt):
-        renderer.handle(event)
+    ui = BigCodeTUI(enabled=True)
+    renderer = BigCodeStreamRenderer(ui)
+    try:
+        async for event in session.run_turn_stream(prompt):
+            renderer.handle(event)
+    finally:
+        renderer.close()
     return None
 
 

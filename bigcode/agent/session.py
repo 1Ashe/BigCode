@@ -1,22 +1,20 @@
 """AgentSession 是 BigCode 的主控制器。
 
-学习思路：一次用户提问会进入 run_turn()，它负责构造上下文、请求模型、执行工具、保存 transcript/snapshot，并在需要时继续下一轮模型调用。
+学习思路：一次用户提问会进入 run_turn_stream()，它负责构造上下文、请求模型、执行工具、保存 transcript/snapshot，并在需要时继续下一轮模型调用。
 """
 from __future__ import annotations
 
 import asyncio
-import sys
 import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
-from bigcode.agent.events import AgentEvent, StatusEvent, StreamEvent, TurnCompleted
+from bigcode.agent.events import AgentEvent, ErrorEvent, StatusEvent, StreamEvent, ToolCompleted, TurnCompleted
 from bigcode.agent.snapshot import SessionSnapshot, load_session_snapshot, save_session_snapshot
 from bigcode.config.models import ResolvedModel, RuntimeConfig
 from bigcode.context.builder import ContextBuildDeps, build_context_for_api
-from bigcode.context.compact import CompactDeps, ContextCompactState, apply_context_compact
+from bigcode.context.compact import ContextCompactState
 from bigcode.context.messages import (
     ApiMessage,
     AssistantMessage,
@@ -55,19 +53,10 @@ from bigcode.tools import ToolExecutionContext, ToolRegistry, ToolRunner, ToolRu
 from bigcode.tools.mcp import register_mcp_tools_from_capabilities
 from bigcode.tools.permissions import ToolPermissionContext, PermissionRule
 from bigcode.tools.read_file_state import ReadFileState
-from bigcode.tui import BigCodeStreamRenderer, BigCodeTUI
 from bigcode.utils.ids import new_id
 
 
-@dataclass
-class AgentTurnResult:
-    """单轮对话的返回值。
-
-    assistant_text 是最终回复文本；tool_results 保存本轮所有工具执行结果；stop_reason 记录模型或流程停止原因。
-    """
-    assistant_text: str
-    tool_results: list[Any] = field(default_factory=list)
-    stop_reason: str | None = None
+TurnStopReason = Literal["end_turn", "max_steps", "unknown_tool_limit", "cancelled"]
 
 
 class AgentSession:
@@ -135,8 +124,8 @@ class AgentSession:
         self.skill_registry = load_skills(config.skill_roots)
         self.mcp_manager = McpClientManager(config.mcp_servers, enabled=config.mcp_enabled)
         self.non_interactive = non_interactive
-        self.ui = BigCodeTUI(enabled=True)
-        self._last_turn_result: AgentTurnResult | None = None
+        self.approval_callback: Any | None = None
+        self.approval_cache: dict[str, bool] = {}
         self.hook_bus = HookBus()
         register_builtin_hooks(self.hook_bus)
 
@@ -207,6 +196,8 @@ class AgentSession:
             artifact_store=self.artifact_store,
             project_state_dir=self.config.project_state_dir,
             tool_registry=self.registry,
+            approval_callback=self.approval_callback,
+            approval_cache=self.approval_cache,
         )
 
     async def start(self) -> None:
@@ -222,8 +213,25 @@ class AgentSession:
 
         一次 turn 可能包含多步：模型先回复工具调用，工具执行结果再回填给模型，直到模型输出最终文本或达到 max_steps。
         """
-        self._last_turn_result = None
+        def complete(
+            stop_reason: TurnStopReason,
+            *,
+            provider_stop_reason: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ) -> TurnCompleted:
+            event_metadata = dict(metadata or {})
+            if provider_stop_reason is not None:
+                event_metadata["provider_stop_reason"] = provider_stop_reason
+            return TurnCompleted(
+                session_id=self.session_id,
+                assistant_text=assistant_text,
+                stop_reason=stop_reason,
+                tool_result_count=len(tool_results),
+                metadata=event_metadata,
+            )
+
         yield StatusEvent(session_id=self.session_id, status="turn_started", metadata={"max_steps": max_steps})
+        self.approval_cache.clear()
         self.compact_state.turn_index += 1
         user_msg = UserMessage(prompt)
         self.messages.append(user_msg)
@@ -235,131 +243,149 @@ class AgentSession:
         turn_tool_names: list[str] = []
         assistant_text = ""
         tool_results: list[Any] = []
-        for step in range(max_steps):
-            self.compact_state.step_index = step
-            yield StatusEvent(session_id=self.session_id, status="model_request_started", metadata={"step": step})
-            await self._sync_mcp_tools_to_registry()
+        consecutive_unknown_tools = 0
+        try:
+            for step in range(max_steps):
+                self.compact_state.step_index = step
+                yield StatusEvent(session_id=self.session_id, status="model_request_started", metadata={"step": step})
+                await self._sync_mcp_tools_to_registry()
 
-            # 每一步请求模型前都重新构建上下文，因为上一轮工具结果、hook 附件、
-            # Plan Mode 状态等都可能刚刚变化。
-            built = await build_context_for_api(
-                self.messages,
-                ContextBuildDeps(
-                    session_id=self.session_id,
-                    cwd=self.config.cwd,
-                    instruction_paths=self.config.instruction_paths,
-                    tool_names=[tool.name for tool in self.registry.list_tools()],
-                    hook_bus=self.hook_bus,
-                    permission_mode=self.permission_context.mode,
-                    plan_mode_state=self.plan_state,
-                    task_store=self.task_store,
-                    task_list_id=self.task_list_id,
-                    capabilities=self._capabilities(),
-                    system_prompt=self.system_prompt,
-                    compact_config=self.config.compact,
-                    compact_state=self.compact_state,
-                    context_window=self.model.context_window or 128000,
-                    tool_schemas=self.registry.schemas_for_model(),
-                    summary_callback=self._summarize_context,
-                    is_main_thread=self.is_main_thread,
-                    protocol=self.model.protocol,
-                ),
-            )
-            self._append_compact_records(built.compact_result.records_to_append)
-            if built.compact_result.blocked:
-                message = (
-                    "Context is too large after compaction "
-                    f"({built.compact_result.utilization_after:.1%} of the model context window)."
-                )
-                yield StatusEvent(session_id=self.session_id, status="context_compaction_blocked", metadata={"step": step})
-                raise RuntimeError(message)
-
-            assistant: AssistantMessage | None = None
-            async for item in self._request_model_stream(
-                built.system_prompt,
-                built.api_messages,
-                self.registry.schemas_for_model(),
-            ):
-                if isinstance(item, AssistantMessage):
-                    assistant = item
-                else:
-                    yield item
-            if assistant is None:
-                raise RuntimeError("Model stream ended without an assistant message.")
-
-            yield StatusEvent(session_id=self.session_id, status="model_response_completed", metadata={"step": step})
-            self.messages.append(assistant)
-            self._append_transcript(assistant)
-            text = text_from_blocks(assistant.content)
-            if text:
-                assistant_text = text
-            tool_uses = [ToolUse(block.id, block.name, block.input) for block in assistant.content if isinstance(block, ToolUseBlock)]
-            if not tool_uses:
-                # 没有工具调用通常表示模型准备结束本轮；Stop hook 仍有最后机会
-                # 要求继续，例如 Plan Mode 必须用 ExitPlanMode/AskUserQuestion 收尾。
-                stop = await self.hook_bus.emit(
-                    "Stop",
-                    HookInput(
-                        "Stop",
-                        self.session_id,
-                        str(self.config.cwd),
-                        self.permission_context.mode,
-                        payload={"turn_tool_names": turn_tool_names, "plan_mode_state": self.plan_state, "last_assistant_text": assistant_text},
+                # 每一步请求模型前都重新构建上下文，因为上一轮工具结果、hook 附件、
+                # Plan Mode 状态等都可能刚刚变化。
+                yield StatusEvent(session_id=self.session_id, status="compact_started", metadata={"step": step, "type": "auto"})
+                built = await build_context_for_api(
+                    self.messages,
+                    ContextBuildDeps(
+                        session_id=self.session_id,
+                        cwd=self.config.cwd,
+                        instruction_paths=self.config.instruction_paths,
+                        tool_names=[tool.name for tool in self.registry.list_tools()],
+                        hook_bus=self.hook_bus,
+                        permission_mode=self.permission_context.mode,
+                        plan_mode_state=self.plan_state,
+                        task_store=self.task_store,
+                        task_list_id=self.task_list_id,
+                        capabilities=self._capabilities(),
+                        system_prompt=self.system_prompt,
+                        compact_config=self.config.compact,
+                        compact_state=self.compact_state,
+                        context_window=self.model.context_window or 128000,
+                        tool_schemas=self.registry.schemas_for_model(),
+                        summary_callback=self._summarize_context,
+                        is_main_thread=self.is_main_thread,
+                        protocol=self.model.protocol,
                     ),
                 )
-                if stop.continue_turn and step + 1 < max_steps:
-                    reminder = UserMessage(stop.reason or "Continue.", is_meta=True, origin="hooks")
-                    self.messages.append(reminder)
-                    self._append_transcript(reminder)
-                    continue
-                yield StatusEvent(session_id=self.session_id, status="turn_completed", metadata={"stop_reason": assistant.stop_reason})
-                self._last_turn_result = AgentTurnResult(
-                    assistant_text=assistant_text,
-                    tool_results=list(tool_results),
-                    stop_reason=assistant.stop_reason,
-                )
-                yield TurnCompleted(
+                yield StatusEvent(
                     session_id=self.session_id,
-                    assistant_text=assistant_text,
-                    stop_reason=assistant.stop_reason,
-                    tool_result_count=len(tool_results),
+                    status="compact_completed",
+                    metadata={
+                        "step": step,
+                        "type": "auto",
+                        "tokens_before": built.compact_result.tokens_before,
+                        "tokens_after": built.compact_result.tokens_after,
+                        "blocked": built.compact_result.blocked,
+                    },
                 )
-                return
-            turn_tool_names.extend(t.name for t in tool_uses)
+                self._append_compact_records(built.compact_result.records_to_append)
+                if built.compact_result.blocked:
+                    message = (
+                        "Context is too large after compaction "
+                        f"({built.compact_result.utilization_after:.1%} of the model context window)."
+                    )
+                    yield StatusEvent(
+                        session_id=self.session_id,
+                        status="context_compaction_blocked",
+                        metadata={"step": step, "tokens_before": built.compact_result.tokens_before, "tokens_after": built.compact_result.tokens_after},
+                    )
+                    raise RuntimeError(message)
 
-            # 模型请求工具时，不直接把结果返回给用户；先执行工具，再把 tool_result
-            # 作为新的用户侧 meta 消息塞回 messages，让模型基于结果继续推理。
-            step_results: list[ToolRunResult[Any]] = []
-            async for item in self.runner.run_tool_uses(tool_uses, self.make_tool_context()):
-                if isinstance(item, ToolRunResult):
-                    step_results.append(item)
-                else:
-                    yield item
-            tool_results.extend(step_results)
-            for result in step_results:
-                result_msg = tool_run_result_to_message(result)
-                self.messages.append(result_msg)
-                self._append_transcript(result_msg)
-        yield StatusEvent(session_id=self.session_id, status="turn_max_steps", metadata={"max_steps": max_steps})
-        self._last_turn_result = AgentTurnResult(assistant_text=assistant_text, tool_results=list(tool_results), stop_reason="max_steps")
-        yield TurnCompleted(session_id=self.session_id, assistant_text=assistant_text, stop_reason="max_steps", tool_result_count=len(tool_results))
+                assistant: AssistantMessage | None = None
+                buffered_events: list[AgentEvent] = []
+                async for item in self._request_model_stream(
+                    built.system_prompt,
+                    built.api_messages,
+                    self.registry.schemas_for_model(),
+                ):
+                    if isinstance(item, AssistantMessage):
+                        assistant = item
+                    else:
+                        buffered_events.append(item)
+                if assistant is None:
+                    raise RuntimeError("Model stream ended without an assistant message.")
 
-    async def run_turn(self, prompt: str, *, max_steps: int = 20, display_stream: bool = False) -> AgentTurnResult:
-        """兼容包装：消费 run_turn_stream() 并返回最终结果。"""
-        renderer = BigCodeStreamRenderer(self.ui) if display_stream else None
-        assistant_text = ""
-        stop_reason: str | None = None
-        tool_result_count = 0
-        async for event in self.run_turn_stream(prompt, max_steps=max_steps):
-            if renderer:
-                renderer.handle(event)
-            if isinstance(event, TurnCompleted):
-                assistant_text = event.assistant_text
-                stop_reason = event.stop_reason
-                tool_result_count = event.tool_result_count
-        if self._last_turn_result is not None:
-            return self._last_turn_result
-        return AgentTurnResult(assistant_text=assistant_text, tool_results=[None] * tool_result_count, stop_reason=stop_reason)
+                yield StatusEvent(session_id=self.session_id, status="model_response_completed", metadata={"step": step})
+                self.messages.append(assistant)
+                self._append_transcript(assistant)
+                text = text_from_blocks(assistant.content)
+                if text:
+                    assistant_text = text
+                tool_uses = [ToolUse(block.id, block.name, block.input) for block in assistant.content if isinstance(block, ToolUseBlock)]
+                if not tool_uses:
+                    # 没有工具调用通常表示模型准备结束本轮；Stop hook 仍有最后机会
+                    # 要求继续，例如 Plan Mode 必须用 ExitPlanMode/AskUserQuestion 收尾。
+                    stop = await self.hook_bus.emit(
+                        "Stop",
+                        HookInput(
+                            "Stop",
+                            self.session_id,
+                            str(self.config.cwd),
+                            self.permission_context.mode,
+                            payload={"turn_tool_names": turn_tool_names, "plan_mode_state": self.plan_state, "last_assistant_text": assistant_text},
+                        ),
+                    )
+                    if stop.continue_turn and step + 1 < max_steps:
+                        reminder = UserMessage(stop.reason or "Continue.", is_meta=True, origin="hooks")
+                        self.messages.append(reminder)
+                        self._append_transcript(reminder)
+                        continue
+                    for event in buffered_events:
+                        yield event
+                    yield StatusEvent(
+                        session_id=self.session_id,
+                        status="turn_completed",
+                        metadata={"stop_reason": "end_turn", "provider_stop_reason": assistant.stop_reason},
+                    )
+                    yield complete("end_turn", provider_stop_reason=assistant.stop_reason)
+                    return
+                turn_tool_names.extend(t.name for t in tool_uses)
+
+                # 模型请求工具时，不直接把结果返回给用户；先执行工具，再把 tool_result
+                # 作为新的用户侧 meta 消息塞回 messages，让模型基于结果继续推理。
+                step_results: list[ToolRunResult[Any]] = []
+                async for item in self.runner.run_tool_uses(tool_uses, self.make_tool_context()):
+                    if isinstance(item, ToolRunResult):
+                        step_results.append(item)
+                        if item.metadata.get("unknown_tool") is True:
+                            consecutive_unknown_tools += 1
+                        else:
+                            consecutive_unknown_tools = 0
+                    else:
+                        yield item
+                tool_results.extend(step_results)
+                for result in step_results:
+                    result_msg = tool_run_result_to_message(result)
+                    self.messages.append(result_msg)
+                    self._append_transcript(result_msg)
+                if consecutive_unknown_tools >= 3:
+                    message = "Stopping turn after 3 consecutive unknown tool calls."
+                    yield ErrorEvent(
+                        session_id=self.session_id,
+                        message=message,
+                        metadata={"limit": 3, "consecutive_unknown_tools": consecutive_unknown_tools},
+                    )
+                    yield complete(
+                        "unknown_tool_limit",
+                        metadata={"limit": 3, "consecutive_unknown_tools": consecutive_unknown_tools},
+                    )
+                    return
+            yield StatusEvent(session_id=self.session_id, status="turn_max_steps", metadata={"max_steps": max_steps})
+            yield complete("max_steps", metadata={"max_steps": max_steps})
+        except asyncio.CancelledError:
+            self.abort_event.set()
+            yield ErrorEvent(session_id=self.session_id, message="Operation cancelled")
+            yield complete("cancelled")
+            return
 
     async def _request_model_stream(
         self,
@@ -458,17 +484,23 @@ class AgentSession:
         stop_reason = None
         error: str | None = None
         try:
-            result = await child.run_turn(prompt, max_steps=definition.max_turns)
-            result_summary = result.assistant_text
-            stop_reason = result.stop_reason
+            assistant_text = ""
+            tool_use_count = 0
+            async for event in child.run_turn_stream(prompt, max_steps=definition.max_turns):
+                if isinstance(event, ToolCompleted):
+                    tool_use_count += 1
+                elif isinstance(event, TurnCompleted):
+                    assistant_text = event.assistant_text
+                    stop_reason = event.stop_reason
+            result_summary = assistant_text
             run_result = AgentRunResult(
                 agent_id=agent_id,
                 agent_type=definition.name,
-                content=result.assistant_text,
-                total_tool_use_count=len(result.tool_results),
+                content=assistant_text,
+                total_tool_use_count=tool_use_count,
                 total_duration_ms=int((time.perf_counter() - started) * 1000),
                 total_tokens=_total_tokens(child.messages),
-                stop_reason=result.stop_reason,
+                stop_reason=stop_reason,
                 sidechain_transcript_path=str(sidechain_transcript_path),
             )
             self._merge_child_written_snapshots(child)
@@ -609,156 +641,6 @@ class AgentSession:
             return {"status": "not_running", "task": state}
         raise RuntimeError(f"Unknown background subAgent task: {agent_id}")
 
-    async def run_repl(self) -> None:
-        """交互式命令行循环。
-
-        TTY 模式会不断 input；管道模式会逐行读取 stdin，支持普通提问和 / 开头的本地命令。
-        """
-        await self.start()
-        self.ui.header(self.session_id, self.model_ref)
-        if self.config.config_errors:
-            # 配置加载阶段收集到的 warning 在启动时先打印出来，
-            # 但不阻止用户继续进入 REPL。
-            self.ui.warning("Config warnings:")
-            for err in self.config.config_errors:
-                self.ui.print(f"  - {err}")
-        if not self.model_ref:
-            self.ui.warning("No model configured. Add .bigcode/models.json with default_model before asking model-backed questions.")
-        if not sys.stdin.isatty():
-            # 非 TTY 通常来自管道，例如 echo "..." | bigcode。
-            # 这种模式不能持续交互，只能逐行处理 stdin。
-            for raw in sys.stdin:
-                line = raw.strip()
-                if not line:
-                    continue
-                if line.startswith("/"):
-                    should_exit = await self.handle_command(line)
-                    if should_exit:
-                        break
-                    continue
-                try:
-                    result = await self.run_turn(line, display_stream=True)
-                except Exception as exc:
-                    self.ui.error(_format_exception(exc))
-                    continue
-            return
-        while True:
-            try:
-                # input() 是阻塞函数；放进 asyncio.to_thread 可以避免堵住事件循环。
-                line = await asyncio.to_thread(input, "\nbigcode> ")
-            except (EOFError, KeyboardInterrupt):
-                self.ui.print()
-                break
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("/"):
-                should_exit = await self.handle_command(line)
-                if should_exit:
-                    break
-                continue
-            try:
-                result = await self.run_turn(line, display_stream=True)
-            except Exception as exc:
-                self.ui.error(_format_exception(exc))
-                continue
-
-    async def handle_command(self, line: str) -> bool:
-        """处理 /help、/doctor、/status、/plan、/compact 等本地命令。
-
-        这些命令不走模型，直接读写当前会话状态或打印诊断信息。
-        """
-        cmd, _, arg = line.partition(" ")
-        if cmd in {"/exit", "/quit"}:
-            # 返回 True 表示 REPL 外层循环应该退出。
-            return True
-        if cmd == "/help":
-            self.ui.print("Commands: /help, /exit, /status, /doctor, /plan, /compact")
-            return False
-        if cmd == "/doctor":
-            from bigcode.diagnostics import build_doctor_report, render_doctor_report
-
-            parts = arg.split()
-            probe = "--no-probe" not in parts
-            timeout = _parse_timeout(parts)
-            # 这里传入当前 session 已经构建好的 registry/skill_registry/mcp_manager，
-            # 避免 doctor 再重复扫描一遍，也能反映当前会话真实状态。
-            report = await build_doctor_report(
-                self.config,
-                model_ref=self.model_ref,
-                probe=probe,
-                timeout=timeout,
-                registry=self.registry,
-                skill_registry=self.skill_registry,
-                mcp_manager=self.mcp_manager,
-            )
-            self.ui.print(render_doctor_report(report), end="")
-            return False
-        if cmd == "/status":
-            # /status 只读当前内存状态，适合排查“当前会话到底记住了什么”。
-            rows: dict[str, Any] = {
-                "session": self.session_id,
-                "cwd": self.config.cwd,
-                "model": self.model_ref,
-                "protocol": self._model_protocol_label(),
-                "permission mode": self.permission_context.mode,
-                "sandbox profile": self.config.sandbox_profile,
-                "messages": len(self.messages),
-                "loaded skills": ", ".join(sorted(self.loaded_skills)) if self.loaded_skills else "(none)",
-            }
-            if self.last_verification:
-                rows["last verification"] = f"{self.last_verification.get('command')} (exit {self.last_verification.get('exit_code')})"
-            counts = self.agent_task_store.status_counts()
-            total_background = sum(counts.values())
-            rows["background subagents"] = (
-                f"{total_background} "
-                f"(queued {counts.get('queued', 0)}, running {counts.get('running', 0)}, "
-                f"completed {counts.get('completed', 0)}, failed {counts.get('failed', 0)}, "
-                f"cancelled {counts.get('cancelled', 0)})"
-            )
-            rows["fastmcp available"] = self.mcp_manager.fastmcp_available
-            self.ui.status_table(rows)
-            return False
-        if cmd == "/plan":
-            if not self.plan_state.active:
-                from bigcode.tools.plan.EnterPlanMode import EnterPlanModeTool
-                from bigcode.tools.base import EmptyInput
-
-                # 本地命令直接调用工具类，复用工具内部对 PlanModeState 的更新逻辑。
-                await EnterPlanModeTool().call(EmptyInput(), self.make_tool_context())
-                self.ui.print(f"Entered Plan Mode: {self.plan_state.plan_file}")
-            else:
-                # 已经在 Plan Mode 时，/plan 只展示当前计划文件，不会退出计划模式。
-                content = self.plan_store.read(self.session_id) or ""
-                self.ui.print(f"Plan file: {self.plan_state.plan_file}")
-                self.ui.print(content or "(empty)")
-            return False
-        if cmd == "/compact":
-            compacted = await apply_context_compact(
-                self.messages,
-                CompactDeps(
-                    config=self.config.compact,
-                    state=self.compact_state,
-                    context_window=self.model.context_window or 128000,
-                    system_prompt=self.system_prompt,
-                    tool_schemas=self.registry.schemas_for_model(),
-                    is_main_thread=self.is_main_thread,
-                    summarize=self._summarize_context,
-                ),
-                force_auto=True,
-            )
-            self._append_compact_records(compacted.records_to_append)
-            self.read_file_state.clear()
-            self._save_snapshot()
-            self.ui.print(
-                "Compacted context: "
-                f"{compacted.tokens_before} -> {compacted.tokens_after} tokens "
-                f"({compacted.utilization_after:.1%})"
-            )
-            return False
-        self.ui.print(f"Unknown command: {cmd}")
-        return False
-
     async def _emit_subagent_hook(
         self,
         event: str,
@@ -839,7 +721,7 @@ class AgentSession:
             return []
         return register_mcp_tools_from_capabilities(self.registry, capabilities)
 
-    def _model_protocol_label(self) -> str:
+    def model_protocol_label(self) -> str:
         """返回当前模型协议；配置错误时返回占位文本。"""
         if not self.model_ref:
             return "(none)"
@@ -985,22 +867,6 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
         seen.add(resolved)
         out.append(resolved)
     return out
-
-
-def _format_exception(exc: Exception) -> str:
-    """把异常转成非空字符串，给命令行显示使用。"""
-    return str(exc).strip() or exc.__class__.__name__
-
-
-def _parse_timeout(parts: list[str]) -> float:
-    """从 /doctor 参数列表里读取 --timeout，失败时回退到默认 10 秒。"""
-    if "--timeout" not in parts:
-        return 10.0
-    idx = parts.index("--timeout")
-    try:
-        return float(parts[idx + 1])
-    except (IndexError, ValueError):
-        return 10.0
 
 
 def _total_tokens(messages: list[MessageBase]) -> int:

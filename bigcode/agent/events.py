@@ -101,6 +101,33 @@ class ToolCompleted:
 
 
 @dataclass(frozen=True)
+class PermissionRequested:
+    """工具权限进入 ask 前发出的可见事件。"""
+
+    session_id: str
+    tool_use_id: str
+    tool_name: str
+    summary: str
+    event_type: Literal["permission_requested"] = "permission_requested"
+    timestamp: float = field(default_factory=_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PermissionResolved:
+    """工具权限 ask 被用户、hook 或模式策略决议后的可见事件。"""
+
+    session_id: str
+    tool_use_id: str
+    tool_name: str
+    approved: bool
+    source: str
+    event_type: Literal["permission_resolved"] = "permission_resolved"
+    timestamp: float = field(default_factory=_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class TurnCompleted:
     """单轮对话完成事件。
 
@@ -108,11 +135,21 @@ class TurnCompleted:
     """
     session_id: str
     assistant_text: str
-    stop_reason: str | None
+    stop_reason: Literal["end_turn", "max_steps", "unknown_tool_limit", "cancelled"]
     tool_result_count: int
     event_type: Literal["turn_completed"] = "turn_completed"
     timestamp: float = field(default_factory=_now)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-AgentEvent = Union[StreamEvent, StatusEvent, ErrorEvent, ToolStarted, ToolProgress, ToolCompleted, TurnCompleted]
+AgentEvent = Union[
+    StreamEvent,
+    StatusEvent,
+    ErrorEvent,
+    ToolStarted,
+    ToolProgress,
+    ToolCompleted,
+    PermissionRequested,
+    PermissionResolved,
+    TurnCompleted,
+]
