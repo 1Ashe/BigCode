@@ -156,7 +156,6 @@ def build_system_prompt(
     role_instruction: str | None = None,
     repo_root: Path | None = None,
     permission_mode: str = "default",
-    sandbox_profile: str = "none",
 ) -> SystemPromptParts:
     """生成会话级 prompt；调用方负责持久化并永久复用结果。"""
     builder = PromptBuilder()
@@ -179,7 +178,6 @@ def build_system_prompt(
         f"Current date: {dt.date.today().isoformat()}",
         f"Platform: {platform.platform()}",
         f"Permission mode: {permission_mode}",
-        f"Sandbox profile: {sandbox_profile}",
         "Initially visible tools: " + ", ".join(sorted(tool_names)),
     ]
     if role_instruction:
@@ -209,7 +207,6 @@ def build_environment_context(
         f"- Platform: {platform.system()} {platform.release()}",
         f"- Current time: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"- Permission mode: {config.permission_context.mode}",
-        f"- Sandbox profile: {config.sandbox_profile}",
         f"- Model: {model_ref or config.default_model_ref or '(not configured)'}",
         "",
         "## BigCode Directories",

@@ -90,7 +90,6 @@ class ToolExecutionContext:
     session_id: str
     hook_bus: "HookBus | None" = None
     is_non_interactive_session: bool = False
-    sandbox_profile: str = "none"
     plan_state: "PlanModeState | None" = None
     task_store: Any | None = None
     plan_store: Any | None = None

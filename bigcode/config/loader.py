@@ -70,7 +70,6 @@ def load_runtime_config(
     # 这样 /doctor 和启动提示可以一次性展示多个问题。
     permission_context = _parse_permissions(settings.get("permissions") or {}, errors)
     workspace_roots = _resolve_workspace_roots(cwd_path, settings.get("workspace_roots") or [], errors)
-    sandbox_profile = _parse_sandbox_profile(settings.get("sandbox") or {}, errors)
     compact_config = _parse_compact_config(settings.get("compact") or {}, errors)
 
     models, model_errors = _parse_models(models_json)
@@ -137,7 +136,6 @@ def load_runtime_config(
         plan_default_dir=plan_dir,
         compact=compact_config,
         task_default_list_id=task_default,
-        sandbox_profile=sandbox_profile,
         config_errors=errors,
     )
 
@@ -196,7 +194,7 @@ def _resolve_workspace_roots(cwd: Path, configured: list[Any], errors: list[str]
 def _parse_permissions(data: dict[str, Any], errors: list[str]) -> ToolPermissionContext:
     """把 settings.json 中的 permissions 字段转为 ToolPermissionContext。"""
     mode = data.get("mode", "default")
-    if mode not in {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"}:
+    if mode not in {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"}:
         # 配置错误不直接中断启动，而是降级到 default 并记录 warning。
         # 这样用户还能运行 /doctor 看到完整诊断。
         errors.append(f"invalid permission mode {mode!r}; using default")
@@ -233,15 +231,6 @@ def _parse_permissions(data: dict[str, Any], errors: list[str]) -> ToolPermissio
         always_ask=[*rules("ask"), *rules("always_ask")],
         should_avoid_permission_prompts=bool(data.get("should_avoid_permission_prompts", False)),
     )
-
-
-def _parse_sandbox_profile(data: dict[str, Any], errors: list[str]) -> str:
-    """解析 sandbox.profile，非法值降级到 none。"""
-    profile = str(data.get("profile") or "none")
-    if profile not in {"none", "read-only", "workspace"}:
-        errors.append(f"invalid sandbox profile {profile!r}; using none")
-        return "none"
-    return profile
 
 
 def _parse_compact_config(data: dict[str, Any], errors: list[str]) -> CompactConfig:

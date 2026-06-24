@@ -95,7 +95,10 @@ async def build_doctor_report(
     _check_tools(report, registry)
     _check_skills(config, report, skill_registry)
     await _check_mcp(config, report, probe=probe, mcp_manager=mcp_manager)
-    await _check_provider_probe(active_model, report, probe=probe, timeout=timeout, env=env)
+    if not any(item.category == "mcp" and item.status in {"WARN", "ERROR"} for item in report.items):
+        await _check_provider_probe(active_model, report, probe=probe, timeout=timeout, env=env)
+    elif active_model is not None:
+        report.add("WARN", "provider", "probe", "provider probe skipped because MCP diagnostics reported local issues")
     return report
 
 
@@ -154,7 +157,6 @@ def _check_workspace(config: RuntimeConfig, report: DoctorReport) -> None:
         report.add("ERROR", "workspace", "workspace roots", "one or more workspace roots do not exist", roots=missing_roots)
     else:
         report.add("OK", "workspace", "workspace roots", f"{len(config.workspace_roots)} workspace root(s)", roots=[str(path) for path in config.workspace_roots])
-    report.add("OK", "workspace", "sandbox profile", config.sandbox_profile)
     home_status = "OK" if config.bigcode_home.exists() else "WARN"
     home_msg = str(config.bigcode_home) if config.bigcode_home.exists() else f"{config.bigcode_home} does not exist yet"
     report.add(home_status, "workspace", "bigcode home", home_msg)

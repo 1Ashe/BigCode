@@ -97,7 +97,7 @@ class AgentSession:
         # 权限上下文会在 Plan Mode、resume 等流程中被修改，所以这里必须复制一份，
         # 不能直接拿 config.permission_context 原对象来改。
         self.permission_context = _clone_permission_context(config.permission_context)
-        if snapshot and snapshot.permission_mode in {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"}:
+        if snapshot and snapshot.permission_mode in {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"}:
             self.permission_context.mode = snapshot.permission_mode
 
         # registry 保存工具定义，runner 负责真正执行工具；二者分开后，
@@ -155,7 +155,6 @@ class AgentSession:
                 instruction_paths=self.config.instruction_paths,
                 role_instruction=system_instruction,
                 permission_mode=self.permission_context.mode,
-                sandbox_profile=self.config.sandbox_profile,
             ).render()
             prompt_snapshot = SystemPromptSnapshotMessage(self.system_prompt)
             self.messages.append(prompt_snapshot)
@@ -202,7 +201,6 @@ class AgentSession:
             session_id=self.session_id,
             hook_bus=self.hook_bus,
             is_non_interactive_session=self.non_interactive,
-            sandbox_profile=self.config.sandbox_profile,
             plan_state=self.plan_state,
             task_store=self.task_store,
             plan_store=self.plan_store,
@@ -224,6 +222,12 @@ class AgentSession:
         """
         await self.hook_bus.emit("SessionStart", HookInput("SessionStart", self.session_id, str(self.config.cwd), self.permission_context.mode))
         self._save_snapshot()
+
+    async def handle_command(self, line: str) -> bool:
+        """Compatibility wrapper for tests and callers that used session-level slash commands."""
+        from bigcode.ui.repl import BigCodeRepl
+
+        return await BigCodeRepl(self).handle_command(line)
 
     async def shutdown(self) -> None:
         """Release external resources and mark unfinished background work as cancelled."""
@@ -248,7 +252,7 @@ class AgentSession:
         except Exception:
             pass
 
-    async def run_turn_stream(self, prompt: str, *, max_steps: int = 20) -> AsyncIterator[AgentEvent]:
+    async def run_turn_stream(self, prompt: str, *, max_steps: int = 50) -> AsyncIterator[AgentEvent]:
         """执行一次用户输入，并以 AgentEvent 流形式产出进度和结果。
 
         一次 turn 可能包含多步：模型先回复工具调用，工具执行结果再回填给模型，直到模型输出最终文本或达到 max_steps。
@@ -491,6 +495,11 @@ class AgentSession:
         agent_id = agent_id or new_id(f"subagent_{definition.name}")
         sidechain_transcript_path = sidechain_transcript_path or self.agent_task_store.transcript_path(agent_id)
         child_abort_event = abort_event or (threading.Event() if is_background else self.abort_event)
+        restore_parent_messages = None
+        if not is_background and len(self.messages) == 2 and isinstance(self.messages[0], SystemPromptSnapshotMessage):
+            second = self.messages[1]
+            if isinstance(second, UserMessage) and second.is_meta and second.origin == "environment":
+                restore_parent_messages = [self.messages[0]]
 
         # 子代理也是一个完整 AgentSession，只是它不保存主 session snapshot，
         # 并使用 sidechain transcript，避免污染父会话的主 transcript。
@@ -560,6 +569,8 @@ class AgentSession:
             stop_reason = "error"
             raise
         finally:
+            if restore_parent_messages is not None:
+                self.messages = restore_parent_messages
             await self._emit_subagent_hook(
                 "SubagentStop",
                 child,
@@ -626,6 +637,16 @@ class AgentSession:
                 sidechain_transcript_path=Path(state.sidechain_transcript_path),
                 abort_event=threading.Event(),
             )
+            if result.stop_reason == "cancelled":
+                state.status = "cancelled"
+                state.completed_at = time.time()
+                state.duration_ms = result.total_duration_ms
+                state.total_tool_use_count = result.total_tool_use_count
+                state.total_tokens = result.total_tokens
+                state.stop_reason = "cancelled"
+                state.result = result_to_dict(result)
+                self.agent_task_store.write_output(state.agent_id, "[Subagent cancelled]\n")
+                return
 
             # 正常完成后，把统计信息和结构化结果都写回 state，再单独写一份人类可读输出。
             state.status = "completed"

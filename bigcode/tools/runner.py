@@ -20,7 +20,7 @@ from bigcode.hooks.models import HookInput
 from .base import PermissionDecision, ToolExecutionContext, ToolRunResult
 from .artifacts import serialized_chars
 from .output_limits import limit_tool_run_result
-from .permissions import build_permission_target, classify_bash, decide_permission
+from .permissions import decide_permission
 from .registry import ToolRegistry
 
 
@@ -72,7 +72,7 @@ class ToolRunner:
 
             async def pump(queue: asyncio.Queue[Any], tool_use: ToolUse) -> None:
                 try:
-                    async for event in self.run_one(tool_use, ctx):
+                    async for event in self.run_one_stream(tool_use, ctx):
                         await queue.put(event)
                 finally:
                     await queue.put(None)
@@ -121,12 +121,25 @@ class ToolRunner:
                 continue
             async for event in flush_safe_batch():
                 yield event
-            async for event in self.run_one(tool_use, ctx):
+            async for event in self.run_one_stream(tool_use, ctx):
                 yield event
         async for event in flush_safe_batch():
             yield event
 
-    async def run_one(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> AsyncIterator[Any]:
+    async def run_one(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> ToolRunResult[Any]:
+        """执行单个工具并返回最终 ToolRunResult。
+
+        流式事件消费请使用 run_one_stream()；这个兼容入口用于测试和只关心最终结果的调用方。
+        """
+        result: ToolRunResult[Any] | None = None
+        async for event in self.run_one_stream(tool_use, ctx):
+            if isinstance(event, ToolRunResult):
+                result = event
+        if result is None:
+            return ToolRunResult(tool_use.id, tool_use.name, is_error=True, error_message="Tool execution did not produce a result.")
+        return result
+
+    async def run_one_stream(self, tool_use: ToolUse, ctx: ToolExecutionContext) -> AsyncIterator[Any]:
         """执行单个工具调用的完整流程。
 
         阅读这个方法能看到工具系统的主链路：找工具、Pydantic 校验、hook、权限、call、截断和 PostToolUse。
@@ -168,101 +181,56 @@ class ToolRunner:
             # 校验后得到的是强类型对象，后面的权限和 call 都使用它。
             input_model = tool.input_model.model_validate(tool_use.input)
         except ValidationError as exc:
+            run_result = ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=f"Invalid input: {exc}")
             for event in self._finish(
                 tool_use,
                 ctx,
                 started,
                 tool.name,
-                ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=f"Invalid input: {exc}"),
+                run_result,
             ):
                 yield event
+            yield run_result
             return
         if not tool.is_enabled(ctx):
+            run_result = ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=f"Tool {tool.name} is disabled.")
             for event in self._finish(
                 tool_use,
                 ctx,
                 started,
                 tool.name,
-                ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=f"Tool {tool.name} is disabled."),
+                run_result,
             ):
                 yield event
+            yield run_result
             return
         validation = await tool.validate_input(input_model, ctx)
         if not validation.ok:
+            run_result = ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=validation.message)
             for event in self._finish(
                 tool_use,
                 ctx,
                 started,
                 tool.name,
-                ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=validation.message),
+                run_result,
             ):
                 yield event
+            yield run_result
             return
 
-        hook_decision: PermissionDecision | None = None
-        if ctx.hook_bus:
-            # 第三步：PreToolUse hook 可以阻止工具，也可以修改工具输入。
-            # 如果 hook 修改了输入，必须重新跑 Pydantic 校验和工具自定义校验。
-            agg = await ctx.hook_bus.emit(
-                "PreToolUse",
-                HookInput(
-                    hook_event_name="PreToolUse",
-                    session_id=ctx.session_id,
-                    cwd=str(ctx.cwd),
-                    permission_mode=ctx.permission_context.mode,
-                    payload={"tool_name": tool.name, "tool_input": input_model.model_dump(), "tool_use_id": tool_use.id},
-                ),
-            )
-            if agg.decision == "block":
-                for event in self._finish(
-                    tool_use,
-                    ctx,
-                    started,
-                    tool.name,
-                    ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=agg.reason or "Blocked by hook."),
-                ):
-                    yield event
-                return
-            if agg.updated_input is not None and agg.updated_input != input_model.model_dump():
-                try:
-                    input_model = tool.input_model.model_validate(agg.updated_input)
-                except ValidationError as exc:
-                    for event in self._finish(
-                        tool_use,
-                        ctx,
-                        started,
-                        tool.name,
-                        ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=f"Hook produced invalid input: {exc}"),
-                    ):
-                        yield event
-                    return
-                validation = await tool.validate_input(input_model, ctx)
-                if not validation.ok:
-                    for event in self._finish(
-                        tool_use,
-                        ctx,
-                        started,
-                        tool.name,
-                        ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=validation.message),
-                    ):
-                        yield event
-                    return
-            if agg.decision in {"approve", "ask"}:
-                behavior = "allow" if agg.decision == "approve" else "ask"
-                hook_decision = PermissionDecision(behavior=behavior, message=agg.reason, reason=agg.reason)
-
-        # 第四步：统一权限系统收敛成 allow / ask / deny。
-        # 即使 hook 批准了，permissions.py 仍会套用硬拒绝。
-        perm = await decide_permission(tool, input_model, ctx, hook_decision=hook_decision)
+        # 第三步：统一权限系统收敛成 allow / ask / deny。
+        perm = await decide_permission(tool, input_model, ctx)
         if perm.behavior == "deny":
+            run_result = ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=perm.message or "Permission denied.")
             for event in self._finish(
                 tool_use,
                 ctx,
                 started,
                 tool.name,
-                ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=perm.message or "Permission denied."),
+                run_result,
             ):
                 yield event
+            yield run_result
             return
         if perm.behavior == "ask":
             from bigcode.agent.events import PermissionRequested, PermissionResolved
@@ -290,18 +258,20 @@ class ToolRunner:
                 source=source,
             )
             if not approved:
+                run_result = ToolRunResult(tool_use.id, tool.name, is_error=True, error_message="permission denied by user.")
                 for event in self._finish(
                     tool_use,
                     ctx,
                     started,
                     tool.name,
-                    ToolRunResult(tool_use.id, tool.name, is_error=True, error_message="permission denied by user."),
+                    run_result,
                 ):
                     yield event
+                yield run_result
                 return
 
         try:
-            # 第五步：真正执行工具。工具内部抛异常也会被包装成 ToolRunResult，
+            # 第四步：真正执行工具。工具内部抛异常也会被包装成 ToolRunResult，
             # 这样模型能收到失败原因，而不是让整个 session 崩掉。
             def on_progress(progress: Any) -> None:
                 from bigcode.agent.events import ToolProgress
@@ -323,7 +293,7 @@ class ToolRunner:
         except Exception as exc:
             run_result = ToolRunResult(tool_use.id, tool.name, is_error=True, error_message=str(exc))
 
-        # 第六步：大结果先落盘成 artifact，再把上下文里的结果裁剪到安全大小。
+        # 第五步：大结果先落盘成 artifact，再把上下文里的结果裁剪到安全大小。
         self._offload_large_result(run_result, tool.max_result_chars, ctx)
         run_result = limit_tool_run_result(run_result, tool.max_result_chars)
         self._record_metadata_carryover(tool.name, input_model.model_dump(), run_result, ctx)
@@ -414,8 +384,6 @@ class ToolRunner:
         """统一处理权限 ask。"""
         if ctx.permission_context.mode == "dontAsk" or ctx.permission_context.should_avoid_permission_prompts:
             return False, "mode"
-        if ctx.permission_context.mode == "auto":
-            return _auto_approve_permission(tool, input_model, decision, ctx), "mode"
         if ctx.is_non_interactive_session:
             if ctx.hook_bus:
                 agg = await ctx.hook_bus.emit(
@@ -590,28 +558,6 @@ def _permission_approval_lines(tool_name: str, data: dict[str, Any], ctx: ToolEx
     if data.get("command"):
         return [f"Approve {tool_name}: {_inline_preview(data['command'])} ?"]
     return [f"Approve {tool_name} ?"]
-
-
-def _auto_approve_permission(tool: Any, input_model: Any, decision: PermissionDecision, ctx: ToolExecutionContext) -> bool:
-    """auto 模式的保守本地分类器。"""
-    if decision.reason_type in {"rule", "safetyCheck", "requiresUserInteraction"}:
-        return False
-    target = build_permission_target(tool, input_model)
-    read_only = _tool_is_read_only(tool, input_model, ctx)
-    if target.category in {"read", "skill"} and read_only:
-        return True
-    if target.category == "state" and read_only:
-        return True
-    if target.category == "bash" and read_only:
-        return True
-    return False
-
-
-def _tool_is_read_only(tool: Any, input_model: Any, ctx: ToolExecutionContext) -> bool:
-    try:
-        return bool(tool.is_read_only(input_model, ctx))
-    except Exception:
-        return False
 
 
 def _permission_summary(tool_name: str, data: dict[str, Any], ctx: ToolExecutionContext) -> str:

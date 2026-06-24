@@ -20,7 +20,7 @@ class AgentDefinition:
     disallowed_tools: list[str] | None = None
     model: str | None = None
     permission_mode: str | None = None
-    max_turns: int = 8
+    max_turns: int = 50
     background: bool = False
 
 
@@ -33,7 +33,7 @@ def get_builtin_agents() -> list[AgentDefinition]:
             description="General coding subAgent for bounded implementation or investigation tasks.",
             system_prompt="You are a focused coding subAgent. Complete the delegated task and return concise results.",
             tools=None,
-            max_turns=8,
+            max_turns=50,
         ),
         # explorer 是只读代码探索者，permission_mode=plan 会禁止写入。
         AgentDefinition(
@@ -42,7 +42,7 @@ def get_builtin_agents() -> list[AgentDefinition]:
             system_prompt="You are a read-only explorer. Inspect code and report findings with file paths. Do not edit.",
             tools=["Read", "Glob", "Grep", "Bash", "SkillLoad", "SkillResourceRead", "ExternalResourceRead", "ExternalPromptGet"],
             permission_mode="plan",
-            max_turns=6,
+            max_turns=50,
         ),
         # code-reviewer 也是只读，但提示词偏向发现缺陷和测试缺口。
         AgentDefinition(
@@ -51,7 +51,7 @@ def get_builtin_agents() -> list[AgentDefinition]:
             system_prompt="Review code changes for defects. Report findings first, with file references.",
             tools=["Read", "Glob", "Grep", "Bash"],
             permission_mode="plan",
-            max_turns=6,
+            max_turns=50,
         ),
         # planAgent 用来把已有发现整理成计划，工具和权限都保持只读。
         AgentDefinition(
@@ -60,7 +60,7 @@ def get_builtin_agents() -> list[AgentDefinition]:
             system_prompt="Create a decision-complete implementation plan from provided context. Do not edit files.",
             tools=["Read", "Glob", "Grep", "Bash"],
             permission_mode="plan",
-            max_turns=4,
+            max_turns=50,
         ),
     ]
 

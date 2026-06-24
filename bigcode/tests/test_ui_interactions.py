@@ -7,13 +7,14 @@ from pathlib import Path
 from threading import Event
 from unittest.mock import patch
 
-from bigcode.agent.events import PermissionRequested, PermissionResolved, StreamEvent, ToolCompleted, ToolStarted, TurnCompleted
+from bigcode.agent.events import PermissionRequested, PermissionResolved, StatusEvent, StreamEvent, ToolCompleted, ToolStarted, TurnCompleted
 from bigcode.plan import PlanModeState, PlanStore
 from bigcode.tools.base import ToolExecutionContext
 from bigcode.tools.permissions import ToolPermissionContext
 from bigcode.tools.plan.AskUserQuestion import AskUserQuestionInput, AskUserQuestionTool, UserQuestion
 from bigcode.tools.plan.ExitPlanMode import ExitPlanModeInput, ExitPlanModeTool
 from bigcode.tools.read_file_state import ReadFileState
+from bigcode.ui.repl import BigCodeRepl
 from bigcode.ui.renderer import BigCodeStreamRenderer
 
 
@@ -144,6 +145,39 @@ class UIInteractionTests(unittest.TestCase):
 
         self.assertEqual(result.data, {"answers": [{"question": "Pick?", "kind": "single", "answer": "A"}]})
         self.assertEqual(len(callbacks), 1)
+
+    def test_run_turn_cancellation_cleans_up_and_does_not_bubble(self) -> None:
+        class FakeSession:
+            session_id = "sess"
+            model_ref = "model"
+
+            def __init__(self, started: asyncio.Event) -> None:
+                self.abort_event = Event()
+                self.started = started
+
+            async def run_turn_stream(self, prompt: str):
+                yield StatusEvent("sess", "turn_started")
+                self.started.set()
+                await asyncio.sleep(10)
+
+        async def run_and_cancel() -> tuple[FakeSession, list[FakeStatus]]:
+            started = asyncio.Event()
+            session = FakeSession(started)
+            repl = BigCodeRepl(session, ui=FakeUI())  # type: ignore[arg-type]
+            FakeStatus.instances = []
+            with patch("bigcode.ui.renderer.Status", FakeStatus), patch("bigcode.ui.renderer.Text", FakeText):
+                task = asyncio.create_task(repl.run_turn("hello", allow_escape_cancel=False))
+                await asyncio.wait_for(started.wait(), timeout=1)
+                await asyncio.sleep(0)
+                task.cancel()
+                await task
+            return session, FakeStatus.instances
+
+        session, statuses = asyncio.run(run_and_cancel())
+
+        self.assertFalse(session.abort_event.is_set())
+        self.assertTrue(statuses)
+        self.assertTrue(statuses[0].stopped)
 
 
 def _make_plan_context(root: Path, approval_callback) -> ToolExecutionContext:

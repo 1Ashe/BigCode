@@ -72,7 +72,10 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit("bigcode run requires a prompt argument")
         asyncio.run(_run_once(session, args.arg, event_stream=args.event_stream))
         return
-    asyncio.run(run_repl(session))
+    try:
+        asyncio.run(run_repl(session))
+    except KeyboardInterrupt:
+        pass
 
 
 async def _run_once(session: AgentSession, prompt: str, *, event_stream: str = "off"):

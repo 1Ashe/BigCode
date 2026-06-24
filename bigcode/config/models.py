@@ -107,5 +107,4 @@ class RuntimeConfig:
     plan_default_dir: Path
     compact: CompactConfig = field(default_factory=CompactConfig)
     task_default_list_id: str | None = None
-    sandbox_profile: str = "none"
     config_errors: list[str] = field(default_factory=list)

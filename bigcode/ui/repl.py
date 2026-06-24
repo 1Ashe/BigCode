@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 import sys
 import threading
 from typing import Any
@@ -129,16 +130,36 @@ class BigCodeRepl:
 
         self.session.abort_event.clear()
         task = asyncio.create_task(consume())
+        restore_terminal = _capture_terminal_restore()
+
+        def _sigint_handler() -> None:
+            renderer.close()
+            self.session.abort_event.set()
+            task.cancel()
+
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGINT, _sigint_handler)
+        except NotImplementedError:
+            pass
+
         watcher: asyncio.Task[None] | None = None
         if allow_escape_cancel and sys.stdin.isatty():
             watcher = asyncio.create_task(self._watch_escape_cancel(task))
         try:
             await task
+        except asyncio.CancelledError:
+            self.session.abort_event.set()
         finally:
+            try:
+                loop.remove_signal_handler(signal.SIGINT)
+            except (NotImplementedError, RuntimeError):
+                pass
             if watcher and not watcher.done():
                 watcher.cancel()
                 await asyncio.gather(watcher, return_exceptions=True)
             renderer.close()
+            restore_terminal()
             self.session.abort_event.clear()
             self._renderer = None
 
@@ -250,7 +271,6 @@ class BigCodeRepl:
             "model": self.session.model_ref,
             "protocol": self.session.model_protocol_label(),
             "permission mode": self.session.permission_context.mode,
-            "sandbox profile": self.session.config.sandbox_profile,
             "messages": len(self.session.messages),
             "loaded skills": ", ".join(sorted(self.session.loaded_skills)) if self.session.loaded_skills else "(none)",
         }
@@ -287,3 +307,30 @@ def parse_timeout(parts: list[str]) -> float:
         return float(parts[idx + 1])
     except (IndexError, ValueError):
         return 10.0
+
+
+def _capture_terminal_restore() -> Any:
+    """Capture current terminal attrs and return an idempotent restore callback."""
+    if sys.platform == "win32" or not sys.stdin.isatty():
+        return lambda: None
+    try:
+        import termios
+
+        fd = sys.stdin.fileno()
+        settings = termios.tcgetattr(fd)
+    except Exception:
+        return lambda: None
+
+    restored = False
+
+    def restore() -> None:
+        nonlocal restored
+        if restored:
+            return
+        restored = True
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, settings)
+        except Exception:
+            pass
+
+    return restore

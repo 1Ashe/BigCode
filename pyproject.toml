@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bigcode"
+version = "0.1.0"
+description = "A compact Python coding agent inspired by Claude Code."
+requires-python = ">=3.12"
+dependencies = [
+  "anthropic>=0.69,<1",
+  "pydantic>=2",
+  "httpx>=0.25",
+  "markdownify>=0.11,<2",
+  "openai>=2.31,<3",
+  "rich>=13,<15",
+  "prompt_toolkit>=3.0,<4",
+]
+
+[project.scripts]
+bigcode = "bigcode.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bigcode*"]
+
+[tool.setuptools.package-data]
+"bigcode.skills" = ["builtin/*/SKILL.md"]
