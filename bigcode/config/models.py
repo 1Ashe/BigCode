@@ -1,12 +1,15 @@
 """配置层使用的数据模型。
 
-学习思路：这里的 dataclass 不执行业务逻辑，只把“运行时需要的配置”集中成结构化对象，方便其它模块传递。
+学习思路：这里的 dataclass 不执行业务逻辑，只把"运行时需要的配置"集中成结构化对象，方便其它模块传递。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from bigcode.sandbox.models import SandboxConfig
 
 
 ModelProtocol = Literal["anthropic", "openai"]
@@ -106,5 +109,6 @@ class RuntimeConfig:
     instruction_paths: list[Path]
     plan_default_dir: Path
     compact: CompactConfig = field(default_factory=CompactConfig)
+    sandbox_config: "SandboxConfig | None" = None
     task_default_list_id: str | None = None
     config_errors: list[str] = field(default_factory=list)

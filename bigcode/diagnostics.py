@@ -91,6 +91,7 @@ async def build_doctor_report(
     # 每个检查函数只负责往 report 里追加 DiagnosticItem。
     _check_config(config, report)
     _check_workspace(config, report)
+    _check_sandbox(config, report)
     active_model = _check_models(config, active_model_ref, report, env)
     _check_tools(report, registry)
     _check_skills(config, report, skill_registry)
@@ -160,6 +161,55 @@ def _check_workspace(config: RuntimeConfig, report: DoctorReport) -> None:
     home_status = "OK" if config.bigcode_home.exists() else "WARN"
     home_msg = str(config.bigcode_home) if config.bigcode_home.exists() else f"{config.bigcode_home} does not exist yet"
     report.add(home_status, "workspace", "bigcode home", home_msg)
+
+
+def _check_sandbox(config: RuntimeConfig, report: DoctorReport) -> None:
+    """Check sandbox status: enabled, platform, and dependency availability."""
+    from bigcode.sandbox import check_dependencies, detect_platform
+
+    sc = config.sandbox_config
+    if sc is None or not sc.enabled:
+        report.add("OK", "sandbox", "status", "sandbox is disabled")
+        return
+
+    platform = detect_platform()
+    if platform not in ("linux", "wsl"):
+        report.add(
+            "ERROR" if sc.fail_if_unavailable else "WARN",
+            "sandbox",
+            "platform",
+            f"sandbox.enabled is set but {platform} is not supported (requires Linux or WSL2)",
+        )
+        return
+
+    report.add("OK", "sandbox", "platform", f"supported platform: {platform}")
+
+    deps = check_dependencies()
+    if deps.errors:
+        report.add(
+            "ERROR" if sc.fail_if_unavailable else "WARN",
+            "sandbox",
+            "dependencies",
+            f"missing: {', '.join(deps.errors)}",
+        )
+    else:
+        report.add("OK", "sandbox", "dependencies", "bwrap is available")
+
+    for warning in deps.warnings:
+        report.add("WARN", "sandbox", "dependencies", warning)
+
+    report.add(
+        "OK",
+        "sandbox",
+        "configuration",
+        f"autoAllow={sc.auto_allow_bash_if_sandboxed}, "
+        f"allowUnsandboxed={sc.allow_unsandboxed_commands}, "
+        f"excludedCommands={len(sc.excluded_commands)}",
+        filesystem_deny_write_count=len(sc.filesystem.deny_write),
+        filesystem_deny_read_count=len(sc.filesystem.deny_read),
+        network_allowed_domains=sc.network.allowed_domains,
+        network_denied_domains=sc.network.denied_domains,
+    )
 
 
 def _check_models(

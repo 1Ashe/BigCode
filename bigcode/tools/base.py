@@ -103,6 +103,7 @@ class ToolExecutionContext:
     terminal_interaction_callback: Callable[[Callable[[], Any]], Awaitable[Any]] | None = None
     approval_cache: dict[str, bool] | None = None
     force_turn_end: bool = False
+    sandbox_config: Any | None = None
 
 
 class BaseTool(ABC, Generic[InputT, OutputT]):

@@ -100,6 +100,13 @@ class AgentSession:
         if snapshot and snapshot.permission_mode in {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"}:
             self.permission_context.mode = snapshot.permission_mode
 
+        # 从权限规则推导沙箱配置。沙箱只在 Linux/WSL 上生效，
+        # 且只包裹 Bash 命令。
+        self.sandbox_config = _init_sandbox_config(
+            config=config,
+            permission_context=self.permission_context,
+        )
+
         # registry 保存工具定义，runner 负责真正执行工具；二者分开后，
         # 子代理可以拿到“裁剪过的 registry”，但仍复用同一套执行逻辑。
         self.registry = registry or build_default_registry()
@@ -213,6 +220,7 @@ class AgentSession:
             approval_callback=self.approval_callback,
             terminal_interaction_callback=self.terminal_interaction_callback,
             approval_cache=self.approval_cache,
+            sandbox_config=self.sandbox_config,
         )
 
     async def start(self) -> None:
@@ -1002,3 +1010,50 @@ def _registry_for_subagent(parent: ToolRegistry, definition: AgentDefinition, *,
         child.register(tool)
     child.inherit_discoveries_from(parent)
     return child
+
+
+# ---------------------------------------------------------------------------
+# Sandbox initialization
+# ---------------------------------------------------------------------------
+
+
+def _init_sandbox_config(
+    *,
+    config: RuntimeConfig,
+    permission_context: ToolPermissionContext,
+) -> Any | None:
+    """Derive effective sandbox config from permission rules. Returns None if disabled."""
+    if config.sandbox_config is None:
+        return None
+    from bigcode.sandbox import check_dependencies, derive_sandbox_config, detect_platform
+
+    platform = detect_platform()
+    if platform not in ("linux", "wsl"):
+        if config.sandbox_config.fail_if_unavailable:
+            raise SystemExit(
+                f"sandbox.enabled is set but {platform} is not supported "
+                f"(requires Linux or WSL2)."
+            )
+        return None
+
+    deps = check_dependencies()
+    if deps.errors:
+        if config.sandbox_config.fail_if_unavailable:
+            raise SystemExit(
+                f"sandbox.enabled is set but dependencies are missing: "
+                f"{', '.join(deps.errors)}"
+            )
+        return None
+
+    import tempfile
+    return derive_sandbox_config(
+        permission_context=permission_context,
+        sandbox_config=config.sandbox_config,
+        cwd=config.cwd,
+        workspace_roots=config.workspace_roots,
+        config_roots=config.config_roots,
+        skill_roots=config.skill_roots,
+        agent_roots=config.agent_roots,
+        bigcode_home=config.bigcode_home,
+        temp_dir=tempfile.gettempdir(),
+    )

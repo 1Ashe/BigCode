@@ -9,6 +9,12 @@ import re
 from pathlib import Path
 from typing import Any
 
+from bigcode.sandbox.models import (
+    FilesystemSandboxConfig,
+    NetworkSandboxConfig,
+    SandboxConfig,
+    SandboxDependencyCheck,
+)
 from bigcode.tools.permissions import PermissionRule, ToolPermissionContext, parse_permission_rule_string
 from bigcode.utils.ids import project_id_for_path
 from bigcode.utils.jsonio import deep_merge, read_json_file
@@ -118,6 +124,8 @@ def load_runtime_config(
 
     task_default = env.get("BIGCODE_TASK_LIST_ID") or settings.get("tasks", {}).get("default_task_list_id")
 
+    sandbox_config = _parse_sandbox_settings(settings.get("sandbox") or {}, errors)
+
     return RuntimeConfig(
         cwd=cwd_path,
         repo_root=repo_root,
@@ -135,6 +143,7 @@ def load_runtime_config(
         instruction_paths=instruction_paths,
         plan_default_dir=plan_dir,
         compact=compact_config,
+        sandbox_config=sandbox_config,
         task_default_list_id=task_default,
         config_errors=errors,
     )
@@ -524,3 +533,70 @@ def _instruction_paths(home: Path, repo_root: Path, cwd: Path) -> list[Path]:
     paths.extend(sorted((cwd / ".bigcode" / "rules").glob("*.md")) if (cwd / ".bigcode" / "rules").exists() else [])
     paths.append(cwd / "BIGCODE.local.md")
     return _dedupe_paths(paths)
+
+
+# ---------------------------------------------------------------------------
+# Sandbox settings parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_sandbox_settings(data: dict[str, Any], errors: list[str]) -> SandboxConfig | None:
+    """解析 settings.json 中 sandbox 节，失败时返回 None 并记录 errors。"""
+    if not isinstance(data, dict):
+        return None
+
+    enabled = _sandbox_bool(data, "enabled", True, errors)
+    if not enabled:
+        return SandboxConfig(enabled=False)
+
+    auto_allow = _sandbox_bool(data, "auto_allow_bash_if_sandboxed", False, errors)
+    allow_unsandboxed = _sandbox_bool(data, "allow_unsandboxed_commands", True, errors)
+    fail_if_unavailable = _sandbox_bool(data, "fail_if_unavailable", False, errors)
+    enable_weaker_nested = _sandbox_bool(data, "enable_weaker_nested_sandbox", False, errors)
+
+    network_raw = data.get("network") or {}
+    network = NetworkSandboxConfig(
+        allowed_domains=_sandbox_str_list(network_raw, "allowed_domains", errors),
+        denied_domains=_sandbox_str_list(network_raw, "denied_domains", errors),
+        allow_local_binding=_sandbox_bool(network_raw, "allow_local_binding", False, errors),
+        allow_all_unix_sockets=_sandbox_bool(network_raw, "allow_all_unix_sockets", False, errors),
+    )
+
+    fs_raw = data.get("filesystem") or {}
+    filesystem = FilesystemSandboxConfig(
+        allow_write=_sandbox_str_list(fs_raw, "allow_write", errors),
+        deny_write=_sandbox_str_list(fs_raw, "deny_write", errors),
+        deny_read=_sandbox_str_list(fs_raw, "deny_read", errors),
+        allow_read=_sandbox_str_list(fs_raw, "allow_read", errors),
+    )
+
+    excluded = _sandbox_str_list(data, "excluded_commands", errors)
+
+    return SandboxConfig(
+        enabled=enabled,
+        auto_allow_bash_if_sandboxed=auto_allow,
+        allow_unsandboxed_commands=allow_unsandboxed,
+        fail_if_unavailable=fail_if_unavailable,
+        enable_weaker_nested_sandbox=enable_weaker_nested,
+        network=network,
+        filesystem=filesystem,
+        excluded_commands=excluded,
+    )
+
+
+def _sandbox_bool(raw: dict[str, Any], key: str, default: bool, errors: list[str]) -> bool:
+    value = raw.get(key, default)
+    if isinstance(value, bool):
+        return value
+    errors.append(f"sandbox.{key} must be a boolean; using {default}")
+    return default
+
+
+def _sandbox_str_list(raw: dict[str, Any], key: str, errors: list[str]) -> list[str]:
+    value = raw.get(key)
+    if value is None:
+        return []
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    errors.append(f"sandbox.{key} must be a list of strings; ignoring")
+    return []

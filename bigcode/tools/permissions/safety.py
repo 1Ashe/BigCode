@@ -72,6 +72,8 @@ def check_hard_deny(target: PermissionTarget, ctx: ToolExecutionContext) -> str 
         except Exception as exc:
             return f"Path could not be resolved safely: {exc}"
         if target.category in {"write", "edit", "delete"}:
+            if _is_under_bigcode_dir(resolved):
+                return "Writing to .bigcode directory is denied."
             for prefix in SYSTEM_DENY_PREFIXES:
                 if _is_relative_to(resolved, prefix):
                     return f"Writes to system path {prefix} are denied."
@@ -208,6 +210,11 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_under_bigcode_dir(path: Path) -> bool:
+    """Return True if the path is inside a .bigcode directory."""
+    return ".bigcode" in path.parts
 
 
 def _is_unsafe_network_host(hostname: str) -> bool:
