@@ -39,6 +39,7 @@ class BigCodeRepl:
         if not self.session.model_ref:
             self.ui.warning("No model configured. Add .bigcode/models.json with default_model before asking model-backed questions.")
         self.session.approval_callback = self.approve_tool_action
+        self.session.terminal_interaction_callback = self.run_terminal_interaction
         try:
             if not sys.stdin.isatty():
                 await self._run_piped_stdin()
@@ -46,6 +47,10 @@ class BigCodeRepl:
             await self._run_tty_loop()
         finally:
             self.session.approval_callback = None
+            self.session.terminal_interaction_callback = None
+            shutdown = getattr(self.session, "shutdown", None)
+            if shutdown is not None:
+                await shutdown()
 
     async def _run_piped_stdin(self) -> None:
         """Process each non-empty stdin line as a REPL input."""
@@ -98,9 +103,15 @@ class BigCodeRepl:
 
     async def approve_tool_action(self, line: str) -> bool:
         """Approve a single tool action using the active terminal input UI."""
+        return await self.run_terminal_interaction(lambda: read_yes_no_plain(f"{line} [y/N] "))
+
+    async def run_terminal_interaction(self, callback: Any) -> Any:
+        """Run a blocking terminal interaction while the escape watcher is paused."""
         self._terminal_input_busy.set()
         try:
-            return await asyncio.to_thread(read_yes_no_plain, f"{line} [y/N] ")
+            if sys.stdin.isatty() and sys.platform != "win32":
+                await asyncio.sleep(0.12)
+            return await asyncio.to_thread(callback)
         finally:
             self._terminal_input_busy.clear()
 

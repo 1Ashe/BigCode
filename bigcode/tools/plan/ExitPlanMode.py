@@ -52,7 +52,7 @@ class ExitPlanModeTool(BaseTool[ExitPlanModeInput, dict]):
             raise RuntimeError("Plan file is empty; write a plan before exiting.")
         if ctx.is_non_interactive_session:
             return ToolResult({"requires_approval": True, "plan": plan})
-        approved = await asyncio.to_thread(_approve_plan, plan)
+        approved = await _request_plan_approval(plan, ctx)
         if not approved:
             return ToolResult({"approved": False, "active": True})
         ctx.plan_state.approved_plan = plan
@@ -74,8 +74,21 @@ class ExitPlanModeTool(BaseTool[ExitPlanModeInput, dict]):
         return ToolResult({"approved": True, "active": False})
 
 
-def _approve_plan(plan: str) -> bool:
+async def _request_plan_approval(plan: str, ctx: ToolExecutionContext) -> bool:
+    if ctx.approval_callback is not None:
+        return bool(await ctx.approval_callback(_format_plan_approval_prompt(plan)))
+    return await asyncio.to_thread(_approve_plan_stdin, plan)
+
+
+def _format_plan_approval_prompt(plan: str) -> str:
+    return f"\n--- Plan Approval Request ---\n{plan}\n--- End Plan ---\nApprove this plan?"
+
+
+def _approve_plan_stdin(plan: str) -> bool:
     print("\n--- Plan Approval Request ---")
     print(plan)
     print("--- End Plan ---")
-    return input("Approve this plan? [y/N] ").strip().lower() in {"y", "yes"}
+    try:
+        return input("Approve this plan? [y/N] ").strip().lower() in {"y", "yes"}
+    except (EOFError, KeyboardInterrupt):
+        return False

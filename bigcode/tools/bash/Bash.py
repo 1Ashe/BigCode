@@ -84,6 +84,10 @@ class BashTool(BaseTool[BashInput, dict]):
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=input.timeout)
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
         except asyncio.TimeoutError:
             # 超时必须杀进程并 wait，避免留下后台子进程。
             proc.kill()

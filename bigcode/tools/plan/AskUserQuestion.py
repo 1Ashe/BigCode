@@ -68,7 +68,10 @@ class AskUserQuestionTool(BaseTool[AskUserQuestionInput, dict]):
     async def call(self, input: AskUserQuestionInput, ctx: ToolExecutionContext, on_progress=None) -> ToolResult[dict]:
         if ctx.is_non_interactive_session:
             return ToolResult({"requires_answer": True, "questions": [question.model_dump() for question in input.questions]})
-        answers = await asyncio.to_thread(_ask_questions, input.questions)
+        if ctx.terminal_interaction_callback is not None:
+            answers = await ctx.terminal_interaction_callback(lambda: _ask_questions(input.questions))
+        else:
+            answers = await asyncio.to_thread(_ask_questions, input.questions)
         return ToolResult({"answers": answers})
 
 

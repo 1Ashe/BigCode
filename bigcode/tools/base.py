@@ -101,6 +101,7 @@ class ToolExecutionContext:
     project_state_dir: Path | None = None
     tool_registry: Any | None = None
     approval_callback: Callable[[str], Awaitable[bool]] | None = None
+    terminal_interaction_callback: Callable[[Callable[[], Any]], Awaitable[Any]] | None = None
     approval_cache: dict[str, bool] | None = None
 
 

@@ -77,21 +77,24 @@ def main(argv: list[str] | None = None) -> None:
 
 async def _run_once(session: AgentSession, prompt: str, *, event_stream: str = "off"):
     """启动 session 并执行一次非交互式 prompt。"""
-    await session.start()
-    if event_stream == "jsonl":
-        async for event in session.run_turn_stream(prompt):
-            sys.stdout.write(json.dumps(serialize_agent_event(event), ensure_ascii=False, sort_keys=True))
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-        return None
-    ui = BigCodeTUI(enabled=True)
-    renderer = BigCodeStreamRenderer(ui)
     try:
-        async for event in session.run_turn_stream(prompt):
-            renderer.handle(event)
+        await session.start()
+        if event_stream == "jsonl":
+            async for event in session.run_turn_stream(prompt):
+                sys.stdout.write(json.dumps(serialize_agent_event(event), ensure_ascii=False, sort_keys=True))
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            return None
+        ui = BigCodeTUI(enabled=True)
+        renderer = BigCodeStreamRenderer(ui)
+        try:
+            async for event in session.run_turn_stream(prompt):
+                renderer.handle(event)
+        finally:
+            renderer.close()
+        return None
     finally:
-        renderer.close()
-    return None
+        await session.shutdown()
 
 
 def _render_resume_list(items: list[SessionListItem]) -> str:

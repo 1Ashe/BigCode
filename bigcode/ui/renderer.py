@@ -37,8 +37,6 @@ class BigCodeStreamRenderer:
             self._answer_started = True
             return
         self._close_stream()
-        if self._answer_started and event_type != "turn_completed":
-            return
         if event_type == "status":
             self._handle_status(event)
             return

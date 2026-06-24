@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,6 +42,13 @@ class McpClientManager:
         self._fastmcp_available = _fastmcp_available()
         self._clients: dict[str, Any] = {}
 
+    def _timeout_for(self, server_name: str | None = None) -> float:
+        server = self.servers.get(server_name or "") if server_name else None
+        raw = server.config.get("timeout") if server else None
+        if isinstance(raw, (int, float)) and raw > 0:
+            return float(raw)
+        return 30.0
+
     @property
     def fastmcp_available(self) -> bool:
         """返回当前 Python 环境是否安装了 fastmcp。"""
@@ -62,8 +70,9 @@ class McpClientManager:
                 continue
             try:
                 # _client_for 会懒创建并缓存 client；discover 多次调用不会重复连接。
-                client = await self._client_for(server.name)
-                tools = await _maybe_await(client.list_tools())
+                timeout = self._timeout_for(server.name)
+                client = await self._with_timeout(self._client_for(server.name), server.name, "connect", timeout)
+                tools = await self._with_timeout(_maybe_await(client.list_tools()), server.name, "list_tools", timeout)
                 for tool in tools or []:
                     # 不同 MCP/FastMCP 版本字段名可能略有差异，所以用 _obj_get
                     # 同时兼容 dict、对象属性、inputSchema/input_schema。
@@ -83,9 +92,9 @@ class McpClientManager:
                             always_load=bool(_obj_get(meta, "anthropic/alwaysLoad", False)),
                         )
                     )
-                for resource in await _safe_list(client, "list_resources"):
+                for resource in await self._with_timeout(_safe_list(client, "list_resources"), server.name, "list_resources", timeout):
                     discovered.append(McpCapability(kind="resource", server=server.name, name=_obj_get(resource, "uri", "") or _obj_get(resource, "name", ""), description=_obj_get(resource, "description", "")))
-                for prompt in await _safe_list(client, "list_prompts"):
+                for prompt in await self._with_timeout(_safe_list(client, "list_prompts"), server.name, "list_prompts", timeout):
                     discovered.append(McpCapability(kind="prompt", server=server.name, name=_obj_get(prompt, "name", ""), description=_obj_get(prompt, "description", "")))
             except Exception:
                 # discovery 是能力索引，失败时不能影响主会话；doctor 的探测会单独报告错误。
@@ -99,8 +108,9 @@ class McpClientManager:
             raise RuntimeError("MCP is disabled.")
         if not self._fastmcp_available:
             raise RuntimeError("FastMCP is not installed in this environment.")
-        client = await self._client_for(server_name)
-        return _to_plain(await _maybe_await(client.call_tool(tool_name, arguments, raise_on_error=False)))
+        timeout = self._timeout_for(server_name)
+        client = await self._with_timeout(self._client_for(server_name), server_name, "connect", timeout)
+        return _to_plain(await self._with_timeout(_maybe_await(client.call_tool(tool_name, arguments, raise_on_error=False)), server_name, f"call_tool:{tool_name}", timeout))
 
     async def list_resources(self, server_name: str | None = None) -> list[dict[str, Any]]:
         """列出一个或所有 MCP server 暴露的资源。"""
@@ -109,8 +119,9 @@ class McpClientManager:
         names = [server_name] if server_name else list(self.servers)
         resources: list[dict[str, Any]] = []
         for name in names:
-            client = await self._client_for(name or "")
-            for resource in await _safe_list(client, "list_resources"):
+            timeout = self._timeout_for(name or "")
+            client = await self._with_timeout(self._client_for(name or ""), name or "", "connect", timeout)
+            for resource in await self._with_timeout(_safe_list(client, "list_resources"), name or "", "list_resources", timeout):
                 item = _to_plain(resource)
                 if isinstance(item, dict):
                     # 补上 server 字段，调用方就能知道这个资源来自哪个 MCP server。
@@ -122,8 +133,9 @@ class McpClientManager:
         """读取指定 MCP server 上的一个资源 URI。"""
         if not self._fastmcp_available:
             raise RuntimeError("FastMCP is not installed in this environment.")
-        client = await self._client_for(server_name)
-        return _to_plain(await _maybe_await(client.read_resource(uri)))
+        timeout = self._timeout_for(server_name)
+        client = await self._with_timeout(self._client_for(server_name), server_name, "connect", timeout)
+        return _to_plain(await self._with_timeout(_maybe_await(client.read_resource(uri)), server_name, "read_resource", timeout))
 
     async def list_prompts(self, server_name: str | None = None) -> list[dict[str, Any]]:
         """列出一个或所有 MCP server 暴露的 prompts。"""
@@ -132,8 +144,9 @@ class McpClientManager:
         names = [server_name] if server_name else list(self.servers)
         prompts: list[dict[str, Any]] = []
         for name in names:
-            client = await self._client_for(name or "")
-            for prompt in await _safe_list(client, "list_prompts"):
+            timeout = self._timeout_for(name or "")
+            client = await self._with_timeout(self._client_for(name or ""), name or "", "connect", timeout)
+            for prompt in await self._with_timeout(_safe_list(client, "list_prompts"), name or "", "list_prompts", timeout):
                 item = _to_plain(prompt)
                 if isinstance(item, dict):
                     item.setdefault("server", name)
@@ -144,16 +157,25 @@ class McpClientManager:
         """从指定 MCP server 获取一个 prompt，可传入 prompt 参数。"""
         if not self._fastmcp_available:
             raise RuntimeError("FastMCP is not installed in this environment.")
-        client = await self._client_for(server_name)
-        return _to_plain(await _maybe_await(client.get_prompt(name, arguments or {})))
+        timeout = self._timeout_for(server_name)
+        client = await self._with_timeout(self._client_for(server_name), server_name, "connect", timeout)
+        return _to_plain(await self._with_timeout(_maybe_await(client.get_prompt(name, arguments or {})), server_name, "get_prompt", timeout))
 
     async def close_all(self) -> None:
         """关闭并清空已经创建的 MCP client。"""
-        for client in list(self._clients.values()):
-            close = getattr(client, "close", None)
-            if close:
-                await _maybe_await(close())
-        self._clients.clear()
+        try:
+            for name, client in list(self._clients.items()):
+                close = getattr(client, "close", None)
+                if close:
+                    await self._with_timeout(_maybe_await(close()), name, "close", self._timeout_for(name))
+        finally:
+            self._clients.clear()
+
+    async def _with_timeout(self, awaitable: Any, server_name: str, operation: str, timeout: float) -> Any:
+        try:
+            return await asyncio.wait_for(awaitable, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"MCP server {server_name!r} {operation} timed out after {timeout:g}s") from exc
 
     async def _client_for(self, server_name: str) -> Any:
         """返回指定 server 的 FastMCP client；没有缓存时才创建。"""

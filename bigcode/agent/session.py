@@ -125,6 +125,7 @@ class AgentSession:
         self.mcp_manager = McpClientManager(config.mcp_servers, enabled=config.mcp_enabled)
         self.non_interactive = non_interactive
         self.approval_callback: Any | None = None
+        self.terminal_interaction_callback: Any | None = None
         self.approval_cache: dict[str, bool] = {}
         self.hook_bus = HookBus()
         register_builtin_hooks(self.hook_bus)
@@ -212,6 +213,7 @@ class AgentSession:
             project_state_dir=self.config.project_state_dir,
             tool_registry=self.registry,
             approval_callback=self.approval_callback,
+            terminal_interaction_callback=self.terminal_interaction_callback,
             approval_cache=self.approval_cache,
         )
 
@@ -222,6 +224,29 @@ class AgentSession:
         """
         await self.hook_bus.emit("SessionStart", HookInput("SessionStart", self.session_id, str(self.config.cwd), self.permission_context.mode))
         self._save_snapshot()
+
+    async def shutdown(self) -> None:
+        """Release external resources and mark unfinished background work as cancelled."""
+        for agent_id, task in list(self._background_subagent_runs.items()):
+            if task.done():
+                continue
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                state = self.agent_task_store.read_state(agent_id)
+                if state and state.status in {"queued", "running"}:
+                    state.status = "cancelled"
+                    state.completed_at = time.time()
+                    state.stop_reason = "cancelled"
+                    self.agent_task_store.write_output(state.agent_id, "[Subagent cancelled]\n")
+                    self.agent_task_store.write_state(state)
+            finally:
+                self._background_subagent_runs.pop(agent_id, None)
+        try:
+            await self.mcp_manager.close_all()
+        except Exception:
+            pass
 
     async def run_turn_stream(self, prompt: str, *, max_steps: int = 20) -> AsyncIterator[AgentEvent]:
         """执行一次用户输入，并以 AgentEvent 流形式产出进度和结果。
@@ -316,7 +341,6 @@ class AgentSession:
                     raise RuntimeError(message)
 
                 assistant: AssistantMessage | None = None
-                buffered_events: list[AgentEvent] = []
                 async for item in self._request_model_stream(
                     built.system_prompt,
                     built.api_messages,
@@ -325,7 +349,7 @@ class AgentSession:
                     if isinstance(item, AssistantMessage):
                         assistant = item
                     else:
-                        buffered_events.append(item)
+                        yield item
                 if assistant is None:
                     raise RuntimeError("Model stream ended without an assistant message.")
 
@@ -354,8 +378,6 @@ class AgentSession:
                         self.messages.append(reminder)
                         self._append_transcript(reminder)
                         continue
-                    for event in buffered_events:
-                        yield event
                     yield StatusEvent(
                         session_id=self.session_id,
                         status="turn_completed",
