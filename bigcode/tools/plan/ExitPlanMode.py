@@ -54,6 +54,7 @@ class ExitPlanModeTool(BaseTool[ExitPlanModeInput, dict]):
             return ToolResult({"requires_approval": True, "plan": plan})
         approved = await _request_plan_approval(plan, ctx)
         if not approved:
+            ctx.force_turn_end = True
             return ToolResult({"approved": False, "active": True})
         ctx.plan_state.approved_plan = plan
         ctx.plan_state.active = False

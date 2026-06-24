@@ -390,7 +390,8 @@ class AgentSession:
                 # 模型请求工具时，不直接把结果返回给用户；先执行工具，再把 tool_result
                 # 作为新的用户侧 meta 消息塞回 messages，让模型基于结果继续推理。
                 step_results: list[ToolRunResult[Any]] = []
-                async for item in self.runner.run_tool_uses(tool_uses, self.make_tool_context()):
+                tool_ctx = self.make_tool_context()
+                async for item in self.runner.run_tool_uses(tool_uses, tool_ctx):
                     if isinstance(item, ToolRunResult):
                         step_results.append(item)
                         if item.metadata.get("unknown_tool") is True:
@@ -399,6 +400,14 @@ class AgentSession:
                             consecutive_unknown_tools = 0
                     else:
                         yield item
+                if tool_ctx.force_turn_end:
+                    tool_results.extend(step_results)
+                    for result in step_results:
+                        result_msg = tool_run_result_to_message(result)
+                        self.messages.append(result_msg)
+                        self._append_transcript(result_msg)
+                    yield complete("end_turn")
+                    return
                 tool_results.extend(step_results)
                 for result in step_results:
                     result_msg = tool_run_result_to_message(result)

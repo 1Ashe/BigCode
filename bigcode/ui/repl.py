@@ -27,6 +27,7 @@ class BigCodeRepl:
         self.ui = ui or BigCodeTUI(enabled=True)
         self.prompt_ui: BigCodePromptUI | None = None
         self._terminal_input_busy = threading.Event()
+        self._renderer: BigCodeStreamRenderer | None = None
 
     async def run(self) -> None:
         """Run the interactive command loop."""
@@ -103,6 +104,8 @@ class BigCodeRepl:
 
     async def approve_tool_action(self, line: str) -> bool:
         """Approve a single tool action using the active terminal input UI."""
+        if self._renderer:
+            self._renderer._clear_status()
         return await self.run_terminal_interaction(lambda: read_yes_no_plain(f"{line} [y/N] "))
 
     async def run_terminal_interaction(self, callback: Any) -> Any:
@@ -118,6 +121,7 @@ class BigCodeRepl:
     async def run_turn(self, prompt: str, *, allow_escape_cancel: bool) -> None:
         """Consume and render one session turn."""
         renderer = BigCodeStreamRenderer(self.ui)
+        self._renderer = renderer
 
         async def consume() -> None:
             async for event in self.session.run_turn_stream(prompt):
@@ -136,6 +140,7 @@ class BigCodeRepl:
                 await asyncio.gather(watcher, return_exceptions=True)
             renderer.close()
             self.session.abort_event.clear()
+            self._renderer = None
 
     async def _watch_escape_cancel(self, task: asyncio.Task[Any]) -> None:
         """Cancel the running turn when Esc is pressed outside terminal prompts."""
