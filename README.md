@@ -1,65 +1,54 @@
 # BigCode
 
-A compact Python coding agent CLI inspired by Claude Code. Supports interactive REPL, Plan Mode, subagents, MCP tools, and multiple LLM backends (Anthropic / OpenAI-compatible).
+一个参考 Claude Code 的 Coding Agent，由于 nano、mimo、small 都被用了，于是就取名叫 Big。
 
-## Quick Start
-
-### 1. Environment
+## 环境准备
 
 ```bash
 conda create -n bigcode python=3.12
 conda activate bigcode
-```
-
-### 2. Install dependencies
-
-```bash
 pip install -e .
 ```
 
-### 3. Configure your API key
+## 配置
 
-BigCode reads from environment variables — no config file needed for auth.
+### 1. 设置 API Key 环境变量
 
-**Anthropic (default):**
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+export DEEPSEEK_API_KEY="sk-..."
 ```
 
-**OpenAI-compatible:**
-```bash
-export OPENAI_API_KEY="sk-..."
+### 2. 配置模型 `~/.bigcode/models.json`
+
+```json
+{
+  "default_model": "deepseek:deepseek-v4-pro",
+  "providers": {
+    "deepseek": {
+      "base_url": "https://api.deepseek.com/anthropic",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "models": {
+        "deepseek-v4-pro": {
+          "id": "deepseek-v4-pro",
+          "context_window": 1000000
+        }
+      }
+    }
+  }
+}
 ```
 
-### 4. Run
+- `default_model` — 默认使用的模型，格式为 `provider名:模型key`
+- `providers.<name>.base_url` — API 地址
+- `providers.<name>.api_key_env` — API Key 对应的环境变量名
+- `providers.<name>.models` — 该 provider 下的模型列表
+
+OpenAI 兼容协议将 `protocol` 设为 `"openai"` 即可。
+
+## 运行
 
 ```bash
 bigcode repl
 ```
 
-Type `/help` in the REPL for available slash commands.
-
-## Configuration
-
-Model and permission settings live under `.bigcode/` in your project or home directory:
-
-- `.bigcode/models.json` — define model profiles and select a default
-- `.bigcode/settings.json` — permissions, hooks, sandbox, and other runtime options
-
-See `bigcode config` for diagnostic details about your current setup.
-
-## Features
-
-- **Streaming REPL** — model output and tool calls streamed to the terminal
-- **Plan Mode** — explore and design before writing code (`/plan` or `EnterPlanMode`)
-- **Subagents** — spawn background or synchronous sub-agents with filtered tool access
-- **MCP** — connect external tool servers via FastMCP
-- **Skills** — reusable prompt+tool bundles (built-in: code-review, test-debug, repo-map)
-- **Context compaction** — auto-compact long conversations to stay within context windows
-- **Bash sandboxing** — optional file-system and network isolation for shell commands
-
-## Dependencies
-
-- Python >= 3.12
-- anthropic, openai — LLM backends
-- pydantic, httpx, rich, prompt_toolkit — runtime
+输入 `/help` 查看可用命令。
