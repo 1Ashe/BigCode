@@ -168,7 +168,8 @@ class McpClientManager:
     def server_summaries(self) -> list[tuple[str, str]]:
         """返回已发现 MCP server 的 (name, description) 列表。
 
-        优先级：mcp.json 配置 description > MCP serverInfo.title/description > 工具名列表。
+        优先级：mcp.json 配置 description > MCP serverInfo.title/description > 工具数量提示。
+        不泄露具体工具名——模型应通过 Tool_Search 按需发现。
         只在 discover() 成功调用后有数据。
         """
         result: list[tuple[str, str]] = []
@@ -187,12 +188,8 @@ class McpClientManager:
             if srv_desc:
                 result.append((cap.server, srv_desc))
                 continue
-            server_tools = [c for c in self.capabilities if c.kind == "tool" and c.server == cap.server]
-            tool_names = [t.name for t in server_tools]
-            desc = "Tools: " + ", ".join(tool_names[:8])
-            if len(tool_names) > 8:
-                desc += f" (+{len(tool_names) - 8} more)"
-            result.append((cap.server, desc))
+            tool_count = sum(1 for c in self.capabilities if c.kind == "tool" and c.server == cap.server)
+            result.append((cap.server, f"{tool_count} tool(s) available"))
         return result
 
     async def close_all(self) -> None:

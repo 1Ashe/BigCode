@@ -233,8 +233,7 @@ def build_environment_context(
             [
                 "",
                 "## Deferred Tools",
-                "Use Tool_Search before calling these tools; their schemas are not initially loaded.",
-                *deferred_tools,
+                f"{len(deferred_tools)} deferred tool(s) not loaded. Use Tool_Search to discover and load their schemas.",
             ]
         )
     if config.config_errors:
