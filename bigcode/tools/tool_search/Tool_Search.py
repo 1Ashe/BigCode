@@ -16,15 +16,33 @@ class ToolSearchTool(BaseTool[ToolSearchInput, dict]):
     aliases = ("ToolSearch",)
     description = (
         "Search deferred tools and load their full schemas for future tool calls. Use this when you need a "
-        "specialized or MCP tool that is mentioned in environment context but not currently callable. Query by "
-        "keywords, or use select:<tool_name>[,<tool_name>...] for exact names. After a match is loaded, call the "
-        "returned tool by its schema in a later step."
+        "specialized or MCP tool. Query by keywords, or use select:<tool_name>[,<tool_name>...] for exact names. "
+        "After a match is loaded, call the returned tool by its schema in a later step."
     )
     input_model = ToolSearchInput
     permission_category = "read"
     state_effect = "none"
     always_load = True
     search_hint = "deferred tool discovery search select mcp schema"
+
+    def __init__(self) -> None:
+        self._base_description = self.description
+        self._mcp_source_descriptions: list[tuple[str, str]] = []
+
+    def set_mcp_sources(self, sources: list[tuple[str, str]]) -> None:
+        """注入 MCP 服务来源，动态更新 description 让模型感知可用服务。"""
+        self._mcp_source_descriptions = sources
+        if sources:
+            lines = [
+                self._base_description,
+                "",
+                "Available MCP tool sources (use Tool_Search to discover individual tools):",
+            ]
+            for name, sdesc in sources:
+                lines.append(f"- {name}: {sdesc}")
+            self.description = "\n".join(lines)
+        else:
+            self.description = self._base_description
 
     def is_enabled(self, ctx: ToolExecutionContext) -> bool:
         return True

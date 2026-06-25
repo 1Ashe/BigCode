@@ -778,10 +778,12 @@ class AgentSession:
         caps = self.skill_registry.capabilities()
         if self.config.mcp_enabled:
             if self.mcp_manager.fastmcp_available:
-                caps.append("MCP external tools/resources/prompts configured")
-                for tool in self.registry.deferred_tools():
-                    if getattr(tool, "is_mcp", False):
-                        caps.append(f"Deferred MCP tool available via Tool_Search: {tool.name}")
+                sources = self.mcp_manager.server_summaries()
+                if sources:
+                    parts = [f"{name}: {desc}" for name, desc in sources]
+                    caps.append("MCP servers: " + "; ".join(parts))
+                else:
+                    caps.append("MCP configured (no servers connected yet)")
             else:
                 caps.append("MCP configured but FastMCP is not installed; MCP calls will report dependency_missing")
         return caps
@@ -794,7 +796,11 @@ class AgentSession:
             capabilities = await self.mcp_manager.discover()
         except Exception:
             return []
-        return register_mcp_tools_from_capabilities(self.registry, capabilities)
+        added = register_mcp_tools_from_capabilities(self.registry, capabilities)
+        ts_tool = self.registry.get("Tool_Search")
+        if ts_tool and hasattr(ts_tool, "set_mcp_sources"):
+            ts_tool.set_mcp_sources(self.mcp_manager.server_summaries())
+        return added
 
     def model_protocol_label(self) -> str:
         """返回当前模型协议；配置错误时返回占位文本。"""

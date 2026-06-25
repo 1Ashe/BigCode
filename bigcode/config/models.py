@@ -59,6 +59,10 @@ class McpServerConfig:
     config: dict[str, Any]
     enabled: bool = True
 
+    @property
+    def description(self) -> str:
+        return str(self.config.get("description", "")).strip()
+
 
 @dataclass(frozen=True)
 class CompactConfig:

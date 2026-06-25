@@ -47,12 +47,6 @@ class McpTool(BaseTool[McpToolInput, dict]):
     def is_enabled(self, ctx: ToolExecutionContext) -> bool:
         return ctx.mcp_manager is not None
 
-    def is_concurrency_safe(self, input: McpToolInput, ctx: ToolExecutionContext) -> bool:
-        return self.is_read_only(input, ctx)
-
-    def is_read_only(self, input: McpToolInput, ctx: ToolExecutionContext) -> bool:
-        return self.read_only_hint
-
     async def validate_input(self, input: McpToolInput, ctx: ToolExecutionContext) -> ValidationResult:
         if ctx.mcp_manager is None:
             return ValidationResult(False, "MCP manager is not configured.")

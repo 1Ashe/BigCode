@@ -41,6 +41,7 @@ class McpClientManager:
         self.capabilities: list[McpCapability] = []
         self._fastmcp_available = _fastmcp_available()
         self._clients: dict[str, Any] = {}
+        self._server_descriptions: dict[str, str] = {}
 
     def _timeout_for(self, server_name: str | None = None) -> float:
         server = self.servers.get(server_name or "") if server_name else None
@@ -72,6 +73,9 @@ class McpClientManager:
                 # _client_for 会懒创建并缓存 client；discover 多次调用不会重复连接。
                 timeout = self._timeout_for(server.name)
                 client = await self._with_timeout(self._client_for(server.name), server.name, "connect", timeout)
+                # 从 MCP serverInfo 提取服务级描述
+                if server.name not in self._server_descriptions:
+                    self._server_descriptions[server.name] = _extract_server_description(client)
                 tools = await self._with_timeout(_maybe_await(client.list_tools()), server.name, "list_tools", timeout)
                 for tool in tools or []:
                     # 不同 MCP/FastMCP 版本字段名可能略有差异，所以用 _obj_get
@@ -160,6 +164,36 @@ class McpClientManager:
         timeout = self._timeout_for(server_name)
         client = await self._with_timeout(self._client_for(server_name), server_name, "connect", timeout)
         return _to_plain(await self._with_timeout(_maybe_await(client.get_prompt(name, arguments or {})), server_name, "get_prompt", timeout))
+
+    def server_summaries(self) -> list[tuple[str, str]]:
+        """返回已发现 MCP server 的 (name, description) 列表。
+
+        优先级：mcp.json 配置 description > MCP serverInfo.title/description > 工具名列表。
+        只在 discover() 成功调用后有数据。
+        """
+        result: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for cap in self.capabilities:
+            if cap.kind != "tool":
+                continue
+            if cap.server in seen:
+                continue
+            seen.add(cap.server)
+            server = self.servers.get(cap.server)
+            if server and server.description:
+                result.append((cap.server, server.description))
+                continue
+            srv_desc = self._server_descriptions.get(cap.server, "")
+            if srv_desc:
+                result.append((cap.server, srv_desc))
+                continue
+            server_tools = [c for c in self.capabilities if c.kind == "tool" and c.server == cap.server]
+            tool_names = [t.name for t in server_tools]
+            desc = "Tools: " + ", ".join(tool_names[:8])
+            if len(tool_names) > 8:
+                desc += f" (+{len(tool_names) - 8} more)"
+            result.append((cap.server, desc))
+        return result
 
     async def close_all(self) -> None:
         """关闭并清空已经创建的 MCP client。"""
@@ -256,6 +290,32 @@ def _meta_str(meta: Any, name: str) -> str:
     if not isinstance(value, str):
         return ""
     return " ".join(value.split())
+
+
+def _extract_server_description(client: Any) -> str:
+    """从 FastMCP client 的 serverInfo 中提取服务级描述。
+
+    serverInfo 是 MCP 协议 Implementation 类型，包含 title、version、websiteUrl
+    以及 extra_data 中可能携带的 description。
+    """
+    try:
+        init_result = getattr(client, "initialize_result", None)
+        if init_result is None:
+            return ""
+        server_info = getattr(init_result, "serverInfo", None)
+        if server_info is None:
+            return ""
+        # Implementation.title — MCP 规范定义的可读标题
+        title = _obj_get(server_info, "title", "") or ""
+        if title:
+            return str(title).strip()
+        # Implementation 支持 **extra_data，部分 server 可能填了 description
+        extra_desc = _obj_get(server_info, "description", "") or ""
+        if extra_desc:
+            return str(extra_desc).strip()
+        return ""
+    except Exception:
+        return ""
 
 
 def _to_plain(value: Any) -> Any:
