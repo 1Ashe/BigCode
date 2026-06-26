@@ -5,14 +5,16 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 from bigcode.agent.events import AgentEvent, ErrorEvent, StatusEvent, StreamEvent, ToolCompleted, TurnCompleted
-from bigcode.agent.snapshot import SessionSnapshot, load_session_snapshot, save_session_snapshot
+from bigcode.agent.snapshot import SessionSnapshot, cleanup_old_sessions, load_session_snapshot, save_session_snapshot
 from bigcode.config.models import ResolvedModel, RuntimeConfig
+from bigcode.context.budget import ToolBudgetState, apply_tool_result_budget
 from bigcode.context.builder import ContextBuildDeps, build_context_for_api
 from bigcode.context.compact import ContextCompactState
 from bigcode.context.messages import (
@@ -34,6 +36,8 @@ from bigcode.hooks.builtins import register_builtin_hooks
 from bigcode.hooks.models import HookInput
 from bigcode.hooks import HookBus
 from bigcode.mcp import McpClientManager
+from bigcode.memory import MemoryManager
+from bigcode.memory.auto_memory import schedule_memory_extraction
 from bigcode.models import (
     ClaudeCompatibleModelClient,
     StreamEnd,
@@ -89,6 +93,8 @@ class AgentSession:
 
         # session_id 传进来通常表示“恢复旧会话”；能读到 snapshot 时优先复用旧状态，
         # 读不到时就按新会话处理。这样 resume 和新建会话走同一个初始化路径。
+        if persist_snapshot and is_main_thread:
+            cleanup_old_sessions(config.project_state_dir)
         snapshot = load_session_snapshot(config.project_state_dir, session_id) if session_id and persist_snapshot else None
         self.session_id = session_id or new_id("session")
         self.task_list_id = (snapshot.task_list_id if snapshot else None) or config.task_default_list_id or self.session_id
@@ -116,6 +122,10 @@ class AgentSession:
             turn_index=snapshot.compact_turn_index if snapshot else 0,
             auto_compact_failures=snapshot.compact_auto_failures if snapshot else 0,
         )
+        self.tool_budget_state = ToolBudgetState(
+            seen_ids=set(snapshot.tool_budget_seen_ids) if snapshot else set(),
+            replacements=dict(snapshot.tool_budget_replacements) if snapshot else {},
+        )
 
         # 下面这些字段是 resume 时最需要恢复的会话状态：
         # 文件快照保护编辑安全，技能/验证命令则影响后续上下文提醒。
@@ -136,6 +146,8 @@ class AgentSession:
         self.approval_cache: dict[str, bool] = {}
         self.hook_bus = HookBus()
         register_builtin_hooks(self.hook_bus)
+        self.memory_manager = MemoryManager.for_config(config) if is_main_thread else None
+        self._memory_tasks: set[asyncio.Task[None]] = set()
 
         # transcript 是完整消息流水账，snapshot 是可快速恢复的状态摘要。
         # 两者都保存，是为了兼顾“能恢复完整历史”和“能快速列出/恢复会话”。
@@ -143,6 +155,8 @@ class AgentSession:
         self.artifact_store = ArtifactStore(config.project_state_dir, self.session_id)
         if session_id and load_transcript:
             self.messages = self.transcript.load()
+            self._inject_resume_gap_reminder()
+            self._inject_resume_memory_context()
         prompt_snapshot = next(
             (message for message in self.messages if isinstance(message, SystemPromptSnapshotMessage)),
             None,
@@ -162,6 +176,7 @@ class AgentSession:
                 instruction_paths=self.config.instruction_paths,
                 role_instruction=system_instruction,
                 permission_mode=self.permission_context.mode,
+                memory_content=self.memory_manager.load_index_for_prompt() if self.memory_manager else "",
             ).render()
             prompt_snapshot = SystemPromptSnapshotMessage(self.system_prompt)
             self.messages.append(prompt_snapshot)
@@ -239,6 +254,17 @@ class AgentSession:
 
     async def shutdown(self) -> None:
         """Release external resources and mark unfinished background work as cancelled."""
+        for task in list(self._memory_tasks):
+            if task.done():
+                self._memory_tasks.discard(task)
+                continue
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            finally:
+                self._memory_tasks.discard(task)
         for agent_id, task in list(self._background_subagent_runs.items()):
             if task.done():
                 continue
@@ -305,8 +331,13 @@ class AgentSession:
                 # 每一步请求模型前都重新构建上下文，因为上一轮工具结果、hook 附件、
                 # Plan Mode 状态等都可能刚刚变化。
                 yield StatusEvent(session_id=self.session_id, status="compact_started", metadata={"step": step, "type": "auto"})
-                built = await build_context_for_api(
+                budgeted_messages = apply_tool_result_budget(
                     self.messages,
+                    self.tool_budget_state,
+                    self.artifact_store,
+                )
+                built = await build_context_for_api(
+                    budgeted_messages,
                     ContextBuildDeps(
                         session_id=self.session_id,
                         cwd=self.config.cwd,
@@ -326,6 +357,7 @@ class AgentSession:
                         summary_callback=self._summarize_context,
                         is_main_thread=self.is_main_thread,
                         protocol=self.model.protocol,
+                        project_state_dir=str(self.config.project_state_dir),
                     ),
                 )
                 yield StatusEvent(
@@ -339,18 +371,47 @@ class AgentSession:
                         "blocked": built.compact_result.blocked,
                     },
                 )
-                self._append_compact_records(built.compact_result.records_to_append)
-                if built.compact_result.blocked:
-                    message = (
-                        "Context is too large after compaction "
-                        f"({built.compact_result.utilization_after:.1%} of the model context window)."
+                if built.compact_result.auto_compacted:
+                    # 硬重置：结束旧会话，用新 session_id 开启新会话。
+                    # continuation 文本是 projected 中的唯一一条消息。
+                    self._save_snapshot()
+                    old_session_id = self.session_id
+                    self.session_id = new_id("session")
+                    self.transcript = Transcript(
+                        self.config.project_state_dir / "transcripts" / f"{self.session_id}.jsonl"
                     )
+                    self.artifact_store = ArtifactStore(self.config.project_state_dir, self.session_id)
+                    self.task_list_id = self.session_id
+
+                    self.messages = [
+                        SystemPromptSnapshotMessage(self.system_prompt),
+                        *built.compact_result.projected_messages,
+                    ]
+                    for msg in self.messages:
+                        self.transcript.append(msg)
+
+                    self.compact_state = ContextCompactState()
+                    self.tool_budget_state = ToolBudgetState()
+
+                    self._save_snapshot()
                     yield StatusEvent(
                         session_id=self.session_id,
-                        status="context_compaction_blocked",
-                        metadata={"step": step, "tokens_before": built.compact_result.tokens_before, "tokens_after": built.compact_result.tokens_after},
+                        status="session_reset",
+                        metadata={"old_session_id": old_session_id},
                     )
-                    raise RuntimeError(message)
+                else:
+                    self._append_compact_records(built.compact_result.records_to_append)
+                    if built.compact_result.blocked:
+                        message = (
+                            "Context is too large after compaction "
+                            f"({built.compact_result.utilization_after:.1%} of the model context window)."
+                        )
+                        yield StatusEvent(
+                            session_id=self.session_id,
+                            status="context_compaction_blocked",
+                            metadata={"step": step, "tokens_before": built.compact_result.tokens_before, "tokens_after": built.compact_result.tokens_after},
+                        )
+                        raise RuntimeError(message)
 
                 assistant: AssistantMessage | None = None
                 async for item in self._request_model_stream(
@@ -395,6 +456,7 @@ class AgentSession:
                         status="turn_completed",
                         metadata={"stop_reason": "end_turn", "provider_stop_reason": assistant.stop_reason},
                     )
+                    self._schedule_memory_extraction()
                     yield complete("end_turn", provider_stop_reason=assistant.stop_reason)
                     return
                 turn_tool_names.extend(t.name for t in tool_uses)
@@ -418,6 +480,7 @@ class AgentSession:
                         result_msg = tool_run_result_to_message(result)
                         self.messages.append(result_msg)
                         self._append_transcript(result_msg)
+                    self._schedule_memory_extraction()
                     yield complete("end_turn")
                     return
                 tool_results.extend(step_results)
@@ -438,6 +501,7 @@ class AgentSession:
                     )
                     return
             yield StatusEvent(session_id=self.session_id, status="turn_max_steps", metadata={"max_steps": max_steps})
+            self._schedule_memory_extraction()
             yield complete("max_steps", metadata={"max_steps": max_steps})
         except asyncio.CancelledError:
             self.abort_event.set()
@@ -475,7 +539,12 @@ class AgentSession:
                 tool_blocks.append(ToolUseBlock(id=event.id, name=event.name, input=event.input))
             elif isinstance(event, StreamEnd):
                 stop_reason = event.stop_reason
-                usage = {"input_tokens": event.input_tokens, "output_tokens": event.output_tokens}
+                usage = {
+                    "input_tokens": event.input_tokens,
+                    "output_tokens": event.output_tokens,
+                    "cache_read_input_tokens": event.cache_read_input_tokens,
+                    "cache_creation_input_tokens": event.cache_creation_input_tokens,
+                }
 
         content = []
         content.extend(thinking_blocks)
@@ -839,6 +908,63 @@ class AgentSession:
         if records:
             self._save_snapshot()
 
+    def _inject_resume_gap_reminder(self) -> None:
+        """提醒模型恢复旧会话时重新验证磁盘状态。"""
+        if not self.messages:
+            return
+        latest = max((msg.timestamp for msg in self.messages if isinstance(msg, MessageBase)), default=0.0)
+        if latest <= 0 or time.time() - latest < 24 * 60 * 60:
+            return
+        reminder = UserMessage(
+            (
+                "This session is being resumed after more than 24 hours. "
+                "Files in the workspace may have changed since the previous activity. "
+                "Before relying on old file contents or making edits, re-read the relevant files."
+            ),
+            is_meta=True,
+            origin="resume",
+        )
+        self.messages.append(reminder)
+        self.transcript.append(reminder)
+
+    def _inject_resume_memory_context(self) -> None:
+        """Add current long-term memory index when resuming a frozen prompt."""
+        if not self.memory_manager:
+            return
+        memory = self.memory_manager.load_index_for_prompt()
+        if not memory:
+            return
+        message = UserMessage(
+            (
+                "# Long-Term Memory\n\n"
+                "The following memory index was loaded while resuming this session. "
+                "Use it when relevant, and verify project facts against files before making edits.\n\n"
+                + memory
+            ),
+            is_meta=True,
+            origin="memory",
+        )
+        self.messages.append(message)
+        self.transcript.append(message)
+
+    def _schedule_memory_extraction(self) -> None:
+        """Run long-term memory extraction in the background after a completed turn."""
+        if not self.is_main_thread or not self.memory_manager:
+            return
+        try:
+            task = schedule_memory_extraction(
+                self.memory_manager,
+                client_factory=lambda: _create_model_client(self.model),
+                protocol=self.model.protocol,
+                messages=self.messages,
+            )
+        except Exception:
+            return
+        if task is None:
+            return
+        self._memory_tasks.add(task)
+        task.add_done_callback(lambda done: self._memory_tasks.discard(done))
+
     async def _summarize_context(self, compact_type: str, content: str) -> str:
         """用独立模型请求生成 Collapse/Auto Compact 摘要。"""
         if compact_type == "collapse":
@@ -849,9 +975,49 @@ class AgentSession:
             )
         else:
             instruction = (
-                "Create a structured conversation summary with sections for Primary Request, "
-                "Key Decisions, Files Read or Modified, Errors Encountered, Current State, and "
-                "Pending Tasks. Preserve exact paths and important error text."
+                "You are summarizing a conversation that has exceeded the context window. "
+                "Your summary will become the ONLY context the model has about the earlier conversation.\n\n"
+                "Generate your response in TWO phases:\n\n"
+                "Phase 1 — <analysis>\n"
+                "Think through the conversation systematically. Identify:\n"
+                "- What the user is trying to accomplish\n"
+                "- Key technical decisions and their rationale\n"
+                "- Files touched and why\n"
+                "- Errors encountered and root causes\n"
+                "- What has been completed vs. what remains\n"
+                "- The user's explicit preferences and constraints\n\n"
+                "Phase 2 — <summary>\n"
+                "Based on your analysis, produce a structured summary with these 9 sections:\n\n"
+                "1. Primary Request and Intent\n"
+                "   What the user wants to achieve. Be specific.\n\n"
+                "2. Key Technical Concepts\n"
+                "   Important technologies, patterns, libraries, or architectural decisions discussed.\n\n"
+                "3. Files and Code Sections\n"
+                "   List every file path mentioned. Include key code snippets, function signatures, "
+                "or configuration values that were read or modified.\n\n"
+                "4. Errors and Fixes\n"
+                "   Every error encountered, its root cause, and how it was resolved. Preserve exact "
+                "error messages when available.\n\n"
+                "5. Problem-Solving Approach\n"
+                "   The reasoning and methodology used to tackle the problem.\n\n"
+                "6. All User Messages\n"
+                "   Preserve the user's original words whenever possible. Verbatim quotes are preferred "
+                "over paraphrasing — the user's exact phrasing conveys intent, preferences, and tone "
+                "that summarization loses. If space is limited, prioritize recent messages.\n\n"
+                "7. Pending Tasks\n"
+                "   What has NOT been done yet. Explicit TODOs, unfinished work, or deferred decisions.\n\n"
+                "8. Current Work\n"
+                "   The most detailed section. What was being done in the most recent turns — active "
+                "tool calls, in-progress edits, recent decisions, and the immediate next step.\n\n"
+                "9. Possible Next Steps\n"
+                "   What the model should consider doing next when the conversation resumes.\n\n"
+                "Output format:\n"
+                "<analysis>\n"
+                "... (your internal analysis — this will be discarded)\n"
+                "</analysis>\n\n"
+                "<summary>\n"
+                "... (the 9-section summary — this will be kept)\n"
+                "</summary>"
             )
         messages: list[Any]
         if self.model.protocol == "openai":
@@ -864,7 +1030,12 @@ class AgentSession:
                 assistant = item
         if assistant is None:
             return ""
-        return text_from_blocks(assistant.content)
+        full_text = text_from_blocks(assistant.content).strip()
+        if compact_type == "auto":
+            match = re.search(r"<summary>(.*?)</summary>", full_text, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        return full_text
 
     def _save_snapshot(self) -> None:
         """把可恢复会话需要的状态写入 sessions/<id>.json。"""
@@ -887,6 +1058,8 @@ class AgentSession:
                 system_prompt=self.system_prompt,
                 compact_auto_failures=self.compact_state.auto_compact_failures,
                 compact_turn_index=self.compact_state.turn_index,
+                tool_budget_seen_ids=sorted(self.tool_budget_state.seen_ids),
+                tool_budget_replacements=dict(self.tool_budget_state.replacements),
             ),
         )
 
@@ -935,6 +1108,8 @@ class _CompleteClientAdapter:
             stop_reason=response.message.stop_reason,
             input_tokens=usage.get("input_tokens", 0) if isinstance(usage.get("input_tokens"), int) else 0,
             output_tokens=usage.get("output_tokens", 0) if isinstance(usage.get("output_tokens"), int) else 0,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
         )
 
 

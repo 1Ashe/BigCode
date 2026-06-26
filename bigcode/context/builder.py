@@ -40,6 +40,7 @@ class ContextBuildDeps:
     summary_callback: Callable[[str, str], Awaitable[str]] | None = None
     is_main_thread: bool = True
     protocol: str = "anthropic"
+    project_state_dir: str = ""
 
 
 @dataclass
@@ -104,6 +105,8 @@ async def build_context_for_api(messages: list[MessageBase], deps: ContextBuildD
             extra_context_messages=attachment_messages,
             is_main_thread=deps.is_main_thread,
             summarize=deps.summary_callback,
+            session_id=deps.session_id,
+            project_state_dir=deps.project_state_dir,
         ),
     )
     if deps.hook_bus and compact_result.records_to_append:

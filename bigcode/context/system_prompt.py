@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+MAX_INCLUDE_DEPTH = 5
+INCLUDE_PREFIX = "@include "
+
 
 @dataclass(frozen=True)
 class PromptSection:
@@ -41,6 +44,7 @@ class SystemPromptParts:
     static: str
     dynamic: str
     instructions: str = ""
+    memory: str = ""
 
     def render(self) -> str:
         """把 static、dynamic、instructions 三段拼成最终 system prompt 字符串。"""
@@ -50,6 +54,13 @@ class SystemPromptParts:
                 "# Project Instructions\n\n"
                 "Codebase and user instructions are shown below. They override default behavior when they apply.\n\n"
                 + self.instructions.strip()
+            )
+        if self.memory.strip():
+            parts.append(
+                "# Long-Term Memory\n\n"
+                "The following memory index contains durable user preferences and project facts. "
+                "Use it when relevant, but verify project facts against files before making edits.\n\n"
+                + self.memory.strip()
             )
         return "\n\n".join(p for p in parts if p)
 
@@ -156,6 +167,7 @@ def build_system_prompt(
     role_instruction: str | None = None,
     repo_root: Path | None = None,
     permission_mode: str = "default",
+    memory_content: str = "",
 ) -> SystemPromptParts:
     """生成会话级 prompt；调用方负责持久化并永久复用结果。"""
     builder = PromptBuilder()
@@ -183,7 +195,12 @@ def build_system_prompt(
     if role_instruction:
         dynamic_lines.append("Session role:\n" + role_instruction.strip())
     instructions = _read_instructions(instruction_paths)
-    return SystemPromptParts(static=builder.build(), dynamic="\n".join(dynamic_lines), instructions=instructions)
+    return SystemPromptParts(
+        static=builder.build(),
+        dynamic="\n".join(dynamic_lines),
+        instructions=instructions,
+        memory=memory_content,
+    )
 
 
 def build_environment_context(
@@ -249,11 +266,47 @@ def _read_instructions(paths: list[Path], max_chars: int = 40000) -> str:
         if remaining <= 0 or not path.exists() or not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
+        project_root = _project_root_for_instruction(path)
+        text = _process_includes(text, path.parent, project_root)
         if len(text) > remaining:
             text = text[:remaining] + "\n[truncated]"
         chunks.append(f"## {path}\n{text}")
         remaining -= len(text)
     return "\n\n".join(chunks)
+
+
+def _project_root_for_instruction(path: Path) -> Path:
+    """Find the project boundary used for @include safety checks."""
+    resolved = path.resolve(strict=False)
+    for candidate in [resolved.parent, *resolved.parents]:
+        if (candidate / ".git").exists() or (candidate / ".bigcode").exists():
+            return candidate
+    return resolved.parent
+
+
+def _process_includes(content: str, base_dir: Path, project_root: Path, depth: int = 0) -> str:
+    if depth >= MAX_INCLUDE_DEPTH:
+        return content
+    root = project_root.resolve(strict=False)
+    result: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(INCLUDE_PREFIX):
+            result.append(line)
+            continue
+        rel_path = stripped[len(INCLUDE_PREFIX) :].strip()
+        abs_path = (base_dir / rel_path).resolve(strict=False)
+        try:
+            abs_path.relative_to(root)
+        except ValueError:
+            result.append("<!-- @include blocked: path outside project -->")
+            continue
+        if not abs_path.exists() or not abs_path.is_file():
+            result.append("<!-- @include skipped: file not found -->")
+            continue
+        included = abs_path.read_text(encoding="utf-8", errors="replace")
+        result.append(_process_includes(included, abs_path.parent, root, depth + 1))
+    return "\n".join(result)
 
 
 def _format_paths(title: str, paths: list[Path]) -> str:

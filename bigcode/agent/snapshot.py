@@ -13,6 +13,7 @@ from bigcode.utils.jsonio import read_json_file, read_jsonl, to_jsonable, write_
 
 
 SNAPSHOT_VERSION = 2
+DEFAULT_MAX_SESSION_AGE_DAYS = 30
 
 
 @dataclass
@@ -35,6 +36,8 @@ class SessionSnapshot:
     system_prompt: str | None = None
     compact_auto_failures: int = 0
     compact_turn_index: int = 0
+    tool_budget_seen_ids: list[str] = field(default_factory=list)
+    tool_budget_replacements: dict[str, str] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.time)
     version: int = SNAPSHOT_VERSION
 
@@ -123,6 +126,41 @@ def list_session_snapshots(project_state_dir: Path) -> list[SessionListItem]:
     return sorted(items.values(), key=lambda item: item.updated_at, reverse=True)
 
 
+def cleanup_old_sessions(project_state_dir: Path, *, max_age_days: int = DEFAULT_MAX_SESSION_AGE_DAYS) -> None:
+    """Remove inactive session metadata, transcripts, and tool artifacts."""
+    cutoff = time.time() - max_age_days * 24 * 60 * 60
+    for item in list_session_snapshots(project_state_dir):
+        if not item.updated_at or item.updated_at >= cutoff:
+            continue
+        if item.snapshot_path:
+            _unlink_file(Path(item.snapshot_path))
+        if item.transcript_path:
+            _unlink_file(Path(item.transcript_path))
+        _remove_tree(project_state_dir / "tool-results" / item.session_id)
+
+
+def _unlink_file(path: Path) -> None:
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _remove_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        for child in path.iterdir():
+            if child.is_dir():
+                _remove_tree(child)
+            else:
+                _unlink_file(child)
+        path.rmdir()
+    except OSError:
+        pass
+
+
 def _snapshot_from_dict(data: dict[str, Any]) -> SessionSnapshot | None:
     """把 JSON dict 容错转换为 SessionSnapshot。"""
     try:
@@ -156,6 +194,12 @@ def _snapshot_from_dict(data: dict[str, Any]) -> SessionSnapshot | None:
         system_prompt=str(data["system_prompt"]) if data.get("system_prompt") else None,
         compact_auto_failures=_int_or_zero(data.get("compact_auto_failures")),
         compact_turn_index=_int_or_zero(data.get("compact_turn_index")),
+        tool_budget_seen_ids=[
+            str(item) for item in (data.get("tool_budget_seen_ids") or [])
+        ],
+        tool_budget_replacements={
+            str(k): str(v) for k, v in (data.get("tool_budget_replacements") or {}).items()
+        },
         updated_at=float(data.get("updated_at") or 0.0),
         version=_int_or_zero(data.get("version")) or SNAPSHOT_VERSION,
     )

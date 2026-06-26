@@ -68,6 +68,8 @@ class CompactDeps:
     extra_context_messages: list[MessageBase] = field(default_factory=list)
     is_main_thread: bool = True
     summarize: SummaryCallback | None = None
+    session_id: str = ""
+    project_state_dir: str = ""
 
 
 @dataclass
@@ -103,6 +105,74 @@ class MessageGroup:
         return len(self.messages)
 
 
+@dataclass
+class CompactBudget:
+    """运行时根据模型窗口动态计算的所有压缩阈值（绝对 token 数）。
+
+    B = C - X - S - R，各层阈值 = ratio × B。
+    """
+
+    context_window: int
+    effective_budget: int  # B
+    summary_reserve: int  # X
+    safety_margin: int  # S
+    working_reserve: int  # R
+    snip_trigger: int
+    snip_target: int
+    micro_trigger: int
+    collapse_trigger: int
+    collapse_target: int
+    fast_trigger: int
+    full_trigger: int  # = B
+    blocked: int
+
+
+def compute_compact_budget(
+    context_window: int,
+    max_output_tokens: int | None,
+    config: CompactConfig,
+) -> CompactBudget:
+    """根据模型窗口和配置计算运行时压缩预算。
+
+    X = clamp(C × summary_output_ratio, summary_min_tokens, min(summary_max_tokens, max_output_tokens))
+    S = clamp(C × safety_margin_ratio, safety_margin_min_tokens, safety_margin_max_tokens)
+    R = working_reserve_tokens
+    B = C - X - S - R
+    """
+    C = context_window
+
+    X = min(
+        config.summary_max_tokens,
+        max_output_tokens or config.summary_max_tokens,
+        max(config.summary_min_tokens, int(C * config.summary_output_ratio)),
+    )
+
+    S = min(
+        config.safety_margin_max_tokens,
+        max(config.safety_margin_min_tokens, int(C * config.safety_margin_ratio)),
+    )
+
+    R = config.working_reserve_tokens
+
+    B = C - X - S - R
+
+    return CompactBudget(
+        context_window=C,
+        effective_budget=B,
+        summary_reserve=X,
+        safety_margin=S,
+        working_reserve=R,
+        snip_trigger=int(B * config.snip_trigger_ratio),
+        snip_target=int(B * config.snip_target_ratio),
+        micro_trigger=int(B * config.micro_trigger_ratio),
+        collapse_trigger=int(B * config.collapse_trigger_ratio),
+        collapse_target=int(B * config.collapse_target_ratio),
+        fast_trigger=int(B * config.fast_trigger_ratio),
+        full_trigger=B,
+        blocked=B + int((C - B) * 0.3),
+    )
+
+
 async def apply_context_compact(
     messages: list[MessageBase],
     deps: CompactDeps | None = None,
@@ -111,6 +181,7 @@ async def apply_context_compact(
 ) -> ContextCompactResult:
     """重放已有记录，再按 Snip/Micro/Collapse/Auto 顺序生成新记录。"""
     deps = deps or CompactDeps()
+    budget = compute_compact_budget(deps.context_window, None, deps.config)
     working = list(messages)
     records: list[CompactRecordMessage] = []
     projected = replay_compact_records(working)
@@ -126,9 +197,9 @@ async def apply_context_compact(
     if not force_auto and (
         deps.config.snip_enabled
         and deps.state.snip_applied_turn != deps.state.turn_index
-        and current_utilization >= deps.config.snip_threshold
+        and current_tokens >= budget.snip_trigger
     ):
-        record = _build_snip_record(working, projected, deps, current_tokens)
+        record = _build_snip_record(working, projected, deps, current_tokens, budget)
         if record:
             working.append(record)
             records.append(record)
@@ -139,7 +210,7 @@ async def apply_context_compact(
             current_utilization = _utilization(current_tokens, deps.context_window)
             snipped = True
 
-    if not force_auto:
+    if not force_auto and current_tokens >= budget.micro_trigger:
         micro_record = _build_time_microcompact_record(working, projected, deps, current_tokens)
         if micro_record:
             working.append(micro_record)
@@ -155,9 +226,9 @@ async def apply_context_compact(
     if not force_auto and deps.config.context_collapse_enabled:
         while (
             collapsed_spans < deps.config.collapse_max_spans_per_pass
-            and current_utilization >= deps.config.collapse_threshold
+            and current_tokens >= budget.collapse_trigger
         ):
-            record = await _build_collapse_record(working, projected, deps, current_tokens)
+            record = await _build_collapse_record(working, projected, deps, current_tokens, budget)
             if not record:
                 break
             working.append(record)
@@ -176,33 +247,50 @@ async def apply_context_compact(
     elif force_auto or (
         deps.config.auto_compact_enabled
         and deps.state.turn_start
-        and current_utilization >= deps.config.auto_compact_threshold
         and deps.state.auto_compact_failures < deps.config.auto_max_failures
     ):
-        if not force_auto:
-            await apply_fast_compact(projected, deps)
-        try:
-            record = await _build_auto_record(working, projected, deps, current_tokens, force=force_auto)
-        except RuntimeError:
-            deps.state.auto_compact_failures += 1
-            record = None
-        if record:
-            working.append(record)
-            projected_after = replay_compact_records(working)
-            new_tokens = estimate_context_tokens(projected_after, deps)
-            if new_tokens < current_tokens:
-                record.tokens_after = new_tokens
-                records.append(record)
-                projected = projected_after
-                current_tokens = new_tokens
-                current_utilization = _utilization(current_tokens, deps.context_window)
-                deps.state.auto_compact_failures = 0
-                auto_compacted = True
-            else:
-                working.pop()
+        if force_auto:
+            try:
+                record = await _build_auto_record(working, projected, deps, current_tokens, force=True)
+            except RuntimeError:
                 deps.state.auto_compact_failures += 1
+                record = None
+            if record:
+                working.append(record)
+                projected_after = replay_compact_records(working)
+                new_tokens = estimate_context_tokens(projected_after, deps)
+                if new_tokens < current_tokens:
+                    record.tokens_after = new_tokens
+                    records.append(record)
+                    projected = projected_after
+                    current_tokens = new_tokens
+                    current_utilization = _utilization(current_tokens, deps.context_window)
+                    deps.state.auto_compact_failures = 0
+                    auto_compacted = True
+                else:
+                    working.pop()
+                    deps.state.auto_compact_failures += 1
+        else:
+            auto_estimate = _estimate_tokens_anchored(projected, deps)
+            if auto_estimate >= budget.full_trigger:
+                await apply_fast_compact(projected, deps)
+                current_tokens = auto_estimate
+                current_utilization = _utilization(current_tokens, deps.context_window)
+                try:
+                    continuation_text = await _build_auto_continuation(
+                        working, projected, deps, current_tokens, force=False
+                    )
+                except RuntimeError:
+                    deps.state.auto_compact_failures += 1
+                    continuation_text = None
+                if continuation_text is not None:
+                    projected = [UserMessage(continuation_text)]
+                    current_tokens = estimate_messages_tokens(projected)
+                    current_utilization = _utilization(current_tokens, deps.context_window)
+                    deps.state.auto_compact_failures = 0
+                    auto_compacted = True
 
-    blocked = current_utilization >= deps.config.blocked_threshold
+    blocked = current_tokens >= budget.blocked
     return ContextCompactResult(
         projected_messages=projected,
         records_to_append=records,
@@ -274,6 +362,34 @@ def estimate_context_tokens(messages: list[MessageBase], deps: CompactDeps) -> i
         total += estimate_text_tokens(_json_text(deps.tool_schemas))
     total += estimate_messages_tokens(deps.extra_context_messages)
     return total
+
+
+def _estimate_tokens_anchored(messages: list[MessageBase], deps: CompactDeps) -> int:
+    """以最后一次 API 真实 usage 为锚点，只对锚点之后的新消息做增量估算。
+
+    锚点 = 最后一个 AssistantMessage.usage 中 input + cache_read + cache_creation + output 的总和。
+    增量 = 锚点消息之后新增的消息的 token 估算值。
+    若找不到锚点（首次对话），回退到全量估算。
+    """
+    last_idx = -1
+    last_usage: dict[str, object] = {}
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, AssistantMessage) and msg.usage:
+            last_idx = i
+            last_usage = msg.usage
+            break
+
+    if last_idx < 0:
+        return estimate_context_tokens(messages, deps)
+
+    anchor = sum(v for v in last_usage.values() if isinstance(v, int))
+
+    post_messages = messages[last_idx + 1:]
+    incremental = estimate_messages_tokens(post_messages)
+    incremental += estimate_messages_tokens(deps.extra_context_messages)
+
+    return anchor + incremental
 
 
 def estimate_messages_tokens(messages: Iterable[MessageBase]) -> int:
@@ -396,6 +512,71 @@ def build_message_groups(messages: list[MessageBase]) -> list[MessageGroup]:
     return groups
 
 
+def _extract_file_paths_from_group(group: MessageGroup) -> set[str]:
+    """从消息组中提取工具调用引用的文件路径。
+
+    扫描 Read / Write / Edit / Grep / Glob 等工具的 file_path / path 参数。
+    """
+    file_paths: set[str] = set()
+    for msg in group.messages:
+        if not isinstance(msg, AssistantMessage):
+            continue
+        for block in msg.content:
+            if not isinstance(block, ToolUseBlock):
+                continue
+            name_lower = block.name.casefold()
+            if name_lower not in {"read", "edit", "write", "grep", "glob"}:
+                continue
+            fp = block.input.get("file_path") or block.input.get("path")
+            if isinstance(fp, str) and fp.strip():
+                file_paths.add(fp.strip())
+    return file_paths
+
+
+def _identify_turn_starts(groups: list[MessageGroup]) -> list[int]:
+    """返回包含用户对话起点的组索引。
+
+    一次对话 turn 从非 meta、非工具结果回传的 UserMessage 开始。
+    """
+    turn_starts: list[int] = []
+    for idx, group in enumerate(groups):
+        for msg in group.messages:
+            if isinstance(msg, UserMessage) and not msg.is_meta and msg.origin == "user":
+                has_tool_results = any(
+                    isinstance(b, ToolResultBlock) for b in msg.content
+                )
+                if not has_tool_results:
+                    turn_starts.append(idx)
+                    break
+    return turn_starts
+
+
+def _serialize_groups_to_text(groups: list[MessageGroup]) -> str:
+    """将保留的消息组序列化为可读文本，用于 continuation 的 "Recent Context" 段落。"""
+    messages: list[MessageBase] = []
+    for group in groups:
+        messages.extend(group.messages)
+    return _messages_to_summary_text(messages)
+
+
+def _build_auto_preamble(summary: str, deps: CompactDeps) -> str:
+    """构建 auto-compact 的 continuation 首条消息文本。"""
+    transcript_ref = ""
+    if deps.session_id and deps.project_state_dir:
+        transcript_ref = (
+            f"{deps.project_state_dir}/transcripts/{deps.session_id}.jsonl"
+        )
+    return (
+        "This session is being continued from a previous conversation that ran out of context.\n"
+        "The summary below covers the earlier portion of the conversation.\n\n"
+        f"{summary}\n\n"
+        "--- Recent Context ---\n\n"
+        "{{recent_context}}\n\n"
+        f"If you need specific details from before compaction, read the full transcript at: {transcript_ref}\n\n"
+        "Continue the conversation from where it left off without asking the user any further questions."
+    )
+
+
 async def apply_cached_microcompact(
     messages: list[MessageBase],
     deps: CompactDeps,
@@ -419,6 +600,7 @@ def _build_snip_record(
     projected: list[MessageBase],
     deps: CompactDeps,
     current_tokens: int,
+    budget: CompactBudget,
 ) -> CompactRecordMessage | None:
     groups = build_message_groups(projected)
     _protect_tail(groups, deps.config)
@@ -429,7 +611,7 @@ def _build_snip_record(
                 groups[neighbor].reasons.add("near_edit_or_error")
     desired = max(
         deps.config.snip_min_tokens,
-        current_tokens - int(deps.context_window * deps.config.snip_target),
+        current_tokens - budget.snip_target,
     )
     selected = _select_safe_prefix(
         groups,
@@ -519,6 +701,7 @@ async def _build_collapse_record(
     projected: list[MessageBase],
     deps: CompactDeps,
     current_tokens: int,
+    budget: CompactBudget,
 ) -> CompactRecordMessage | None:
     if deps.summarize is None:
         return None
@@ -526,7 +709,7 @@ async def _build_collapse_record(
     _protect_tail(groups, deps.config)
     desired = max(
         deps.config.collapse_min_tokens_saved,
-        current_tokens - int(deps.context_window * deps.config.collapse_target),
+        current_tokens - budget.collapse_target,
     )
     selected = _select_safe_prefix(
         groups,
@@ -558,6 +741,112 @@ async def _build_collapse_record(
     )
 
 
+async def _build_auto_continuation(
+    ui_messages: list[MessageBase],
+    projected: list[MessageBase],
+    deps: CompactDeps,
+    current_tokens: int,
+    *,
+    force: bool,
+) -> str | None:
+    """构建 auto-compact 的 continuation 首条消息文本，失败返回 None。
+
+    内部先确定要保留的消息组（最近 k 文件 + 最近 i 对话 + 尾部下限），
+    被保护的消息序列化为 "Recent Context" 段落；其余候选消息交由 LLM 生成摘要。
+    最终返回完整的 preamble + summary + recent context + transcript 引用。
+    """
+    if deps.summarize is None:
+        return None
+    groups = build_message_groups(projected)
+    if not groups:
+        return None
+
+    # 清除纯摘要组的多余保护标记
+    for group in groups:
+        if group.protected and group.reasons == {"boundary"} and all(
+            isinstance(message, ContextSummaryMessage) for message in group.messages
+        ):
+            group.protected = False
+            group.reasons.clear()
+
+    config = deps.config
+
+    # -- 最近 k 个文件 --
+    group_file_paths: dict[int, set[str]] = {}
+    for idx, group in enumerate(groups):
+        group_file_paths[idx] = _extract_file_paths_from_group(group)
+
+    file_last_access: dict[str, int] = {}
+    for idx in range(len(groups)):
+        for fp in group_file_paths.get(idx, set()):
+            file_last_access[fp] = idx
+
+    ranked_files = sorted(file_last_access.items(), key=lambda item: item[1], reverse=True)
+    top_k_files = {fp for fp, _ in ranked_files[:config.auto_keep_files]}
+    for idx, fps in group_file_paths.items():
+        if fps & top_k_files:
+            groups[idx].protected = True
+            groups[idx].reasons.add("recent_file_access")
+
+    # -- 最近 i 个对话 turn --
+    turn_starts = _identify_turn_starts(groups)
+    if turn_starts:
+        last_i_turns = max(0, len(turn_starts) - config.auto_keep_conversations)
+        if last_i_turns < len(turn_starts):
+            first_kept_turn_start = turn_starts[last_i_turns]
+            for idx in range(first_kept_turn_start, len(groups)):
+                groups[idx].protected = True
+                groups[idx].reasons.add("recent_turn")
+
+    # -- 尾部下限（沿用 auto_keep_tokens / auto_min_keep_messages） --
+    kept_tokens = 0
+    kept_messages = 0
+    floor_start = len(groups)
+    for idx in range(len(groups) - 1, -1, -1):
+        g = groups[idx]
+        kept_tokens += g.tokens
+        kept_messages += g.message_count
+        floor_start = idx
+        if kept_tokens >= config.auto_keep_tokens and kept_messages >= config.auto_min_keep_messages:
+            break
+    for idx in range(floor_start, len(groups)):
+        groups[idx].protected = True
+        groups[idx].reasons.add("floor_tail")
+
+    if force:
+        force_start = max(0, len(groups) - config.auto_min_keep_messages)
+        for idx in range(force_start, len(groups)):
+            groups[idx].protected = True
+            groups[idx].reasons.add("force_keep")
+
+    # 候选摘要组 = 未受保护的组
+    candidates = [g for g in groups if not g.protected]
+
+    # 移除头部的纯 SystemMessage 组
+    while candidates and all(
+        isinstance(m, SystemMessage) for m in candidates[0].messages
+    ):
+        candidates = candidates[1:]
+
+    if not candidates:
+        return None
+
+    candidate_messages = [msg for group in candidates for msg in group.messages]
+    try:
+        summary = (await deps.summarize("auto", _messages_to_summary_text(candidate_messages))).strip()
+    except Exception as exc:
+        raise RuntimeError("auto compact summary failed") from exc
+    if not summary:
+        raise RuntimeError("auto compact summary was empty")
+
+    # 被保护的消息组序列化为 Recent Context
+    protected_groups = [g for g in groups if g.protected]
+    recent_text = _serialize_groups_to_text(protected_groups)
+
+    preamble = _build_auto_preamble(summary, deps).replace("{{recent_context}}", recent_text)
+    return preamble
+
+
 async def _build_auto_record(
     ui_messages: list[MessageBase],
     projected: list[MessageBase],
@@ -566,6 +855,7 @@ async def _build_auto_record(
     *,
     force: bool,
 ) -> CompactRecordMessage | None:
+    """手动 /compact 使用的原地压缩，生成 CompactRecordMessage。"""
     if deps.summarize is None:
         return None
     groups = build_message_groups(projected)

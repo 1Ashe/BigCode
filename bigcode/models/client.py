@@ -253,6 +253,8 @@ class AnthropicClient(LLMClient):
 
         input_tokens = 0
         output_tokens = 0
+        cache_read_input_tokens = 0
+        cache_creation_input_tokens = 0
         stop_reason: str | None = None
         stream_ended = False
         thinking: dict[int, dict[str, str]] = {}
@@ -269,6 +271,8 @@ class AnthropicClient(LLMClient):
                         usage = getattr(getattr(event, "message", None), "usage", None)
                         input_tokens = getattr(usage, "input_tokens", 0) or 0
                         output_tokens = getattr(usage, "output_tokens", 0) or 0
+                        cache_read_input_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+                        cache_creation_input_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
 
                     elif event_type == "content_block_start":
                         index = event.index
@@ -326,7 +330,13 @@ class AnthropicClient(LLMClient):
                         output_tokens = getattr(usage, "output_tokens", output_tokens) or output_tokens
 
                     elif event_type == "message_stop":
-                        yield StreamEnd(stop_reason=stop_reason, input_tokens=input_tokens, output_tokens=output_tokens)
+                        yield StreamEnd(
+                            stop_reason=stop_reason,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            cache_read_input_tokens=cache_read_input_tokens,
+                            cache_creation_input_tokens=cache_creation_input_tokens,
+                        )
                         stream_ended = True
 
             if not stream_ended:
@@ -452,6 +462,8 @@ class OpenAIClient(LLMClient):
                         stop_reason=self._stop_reason(response),
                         input_tokens=getattr(usage, "input_tokens", 0) or 0,
                         output_tokens=getattr(usage, "output_tokens", 0) or 0,
+                        cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+                        cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
                     )
                     stream_ended = True
 

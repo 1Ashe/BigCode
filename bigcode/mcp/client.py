@@ -168,7 +168,7 @@ class McpClientManager:
     def server_summaries(self) -> list[tuple[str, str]]:
         """返回已发现 MCP server 的 (name, description) 列表。
 
-        优先级：mcp.json 配置 description > MCP serverInfo.title/description > 工具数量提示。
+        优先级：mcp.json 配置 description > MCP serverInfo.description/title > 工具数量提示。
         不泄露具体工具名——模型应通过 Tool_Search 按需发现。
         只在 discover() 成功调用后有数据。
         """
@@ -292,8 +292,8 @@ def _meta_str(meta: Any, name: str) -> str:
 def _extract_server_description(client: Any) -> str:
     """从 FastMCP client 的 serverInfo 中提取服务级描述。
 
-    serverInfo 是 MCP 协议 Implementation 类型，包含 title、version、websiteUrl
-    以及 extra_data 中可能携带的 description。
+    serverInfo 是 MCP 协议 Implementation 类型，优先读取 description 字段，
+    若不存在则回退到 title 字段。
     """
     try:
         init_result = getattr(client, "initialize_result", None)
@@ -302,14 +302,12 @@ def _extract_server_description(client: Any) -> str:
         server_info = getattr(init_result, "serverInfo", None)
         if server_info is None:
             return ""
-        # Implementation.title — MCP 规范定义的可读标题
+        description = _obj_get(server_info, "description", "") or ""
+        if description:
+            return str(description).strip()
         title = _obj_get(server_info, "title", "") or ""
         if title:
             return str(title).strip()
-        # Implementation 支持 **extra_data，部分 server 可能填了 description
-        extra_desc = _obj_get(server_info, "description", "") or ""
-        if extra_desc:
-            return str(extra_desc).strip()
         return ""
     except Exception:
         return ""

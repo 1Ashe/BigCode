@@ -43,7 +43,7 @@ class Transcript:
             msg = deserialize_message(row)
             if msg is not None:
                 messages.append(msg)
-        return messages
+        return truncate_to_complete_tool_chain(messages)
 
 
 def serialize_message(message: Any) -> dict[str, Any]:
@@ -105,6 +105,24 @@ def deserialize_message(row: dict[str, Any]) -> Any | None:
             **identity,
         )
     return None
+
+
+def truncate_to_complete_tool_chain(messages: list[Any]) -> list[Any]:
+    """Drop the trailing suffix after the last fully closed tool-call point."""
+    pending: set[str] = set()
+    last_complete = len(messages)
+    for idx, msg in enumerate(messages):
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, ToolUseBlock) and block.id:
+                    pending.add(block.id)
+        elif isinstance(msg, UserMessage):
+            for block in msg.content:
+                if isinstance(block, ToolResultBlock):
+                    pending.discard(block.tool_use_id)
+        if not pending:
+            last_complete = idx + 1
+    return messages[:last_complete]
 
 
 def _block_from_dict(data: dict[str, Any]) -> Any | None:

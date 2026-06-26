@@ -256,13 +256,6 @@ def _parse_compact_config(data: dict[str, Any], errors: list[str]) -> CompactCon
         errors.append(f"compact.{name} must be a boolean; using default")
         return getattr(defaults, name)
 
-    def positive_int(name: str) -> int:
-        value = data.get(name, getattr(defaults, name))
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
-        errors.append(f"compact.{name} must be a positive integer; using default")
-        return getattr(defaults, name)
-
     def ratio(name: str) -> float:
         value = data.get(name, getattr(defaults, name))
         if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < float(value) < 1:
@@ -270,53 +263,63 @@ def _parse_compact_config(data: dict[str, Any], errors: list[str]) -> CompactCon
         errors.append(f"compact.{name} must be between 0 and 1; using default")
         return getattr(defaults, name)
 
+    def positive_int(name: str) -> int:
+        value = data.get(name, getattr(defaults, name))
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        errors.append(f"compact.{name} must be a positive integer; using default")
+        return getattr(defaults, name)
+
     config = CompactConfig(
         time_microcompact_enabled=boolean("time_microcompact_enabled"),
         time_microcompact_gap_minutes=positive_int("time_microcompact_gap_minutes"),
         time_microcompact_keep_recent=positive_int("time_microcompact_keep_recent"),
         snip_enabled=boolean("snip_enabled"),
-        snip_threshold=ratio("snip_threshold"),
-        snip_target=ratio("snip_target"),
+        snip_trigger_ratio=ratio("snip_trigger_ratio"),
+        snip_target_ratio=ratio("snip_target_ratio"),
         snip_min_messages=positive_int("snip_min_messages"),
         snip_min_tokens=positive_int("snip_min_tokens"),
+        micro_trigger_ratio=ratio("micro_trigger_ratio"),
         context_collapse_enabled=boolean("context_collapse_enabled"),
-        collapse_threshold=ratio("collapse_threshold"),
-        collapse_target=ratio("collapse_target"),
+        collapse_trigger_ratio=ratio("collapse_trigger_ratio"),
+        collapse_target_ratio=ratio("collapse_target_ratio"),
         collapse_min_tokens_saved=positive_int("collapse_min_tokens_saved"),
         collapse_max_spans_per_pass=positive_int("collapse_max_spans_per_pass"),
+        fast_trigger_ratio=ratio("fast_trigger_ratio"),
         auto_compact_enabled=boolean("auto_compact_enabled"),
-        auto_compact_threshold=ratio("auto_compact_threshold"),
         auto_keep_tokens=positive_int("auto_keep_tokens"),
         auto_min_keep_messages=positive_int("auto_min_keep_messages"),
         auto_max_failures=positive_int("auto_max_failures"),
-        blocked_threshold=ratio("blocked_threshold"),
         protected_tail_messages=positive_int("protected_tail_messages"),
         protected_tail_tokens=positive_int("protected_tail_tokens"),
+        summary_max_tokens=positive_int("summary_max_tokens"),
+        summary_min_tokens=positive_int("summary_min_tokens"),
+        summary_output_ratio=ratio("summary_output_ratio"),
+        safety_margin_min_tokens=positive_int("safety_margin_min_tokens"),
+        safety_margin_max_tokens=positive_int("safety_margin_max_tokens"),
+        safety_margin_ratio=ratio("safety_margin_ratio"),
+        working_reserve_tokens=positive_int("working_reserve_tokens"),
+        auto_keep_files=positive_int("auto_keep_files"),
+        auto_keep_conversations=positive_int("auto_keep_conversations"),
     )
-    if config.snip_target >= config.snip_threshold:
-        errors.append("compact.snip_target must be lower than snip_threshold; using defaults")
-        config = CompactConfig(**{**config.__dict__, "snip_target": defaults.snip_target, "snip_threshold": defaults.snip_threshold})
-    if config.collapse_target >= config.collapse_threshold:
-        errors.append("compact.collapse_target must be lower than collapse_threshold; using defaults")
+    # 验证比例递增：snip < micro < collapse < fast < 1.0
+    if not (0 < config.snip_trigger_ratio < config.micro_trigger_ratio < config.collapse_trigger_ratio < config.fast_trigger_ratio < 1):
+        errors.append("compact trigger ratios must increase: snip < micro < collapse < fast < 1.0; using defaults")
         config = CompactConfig(
             **{
                 **config.__dict__,
-                "collapse_target": defaults.collapse_target,
-                "collapse_threshold": defaults.collapse_threshold,
+                "snip_trigger_ratio": defaults.snip_trigger_ratio,
+                "micro_trigger_ratio": defaults.micro_trigger_ratio,
+                "collapse_trigger_ratio": defaults.collapse_trigger_ratio,
+                "fast_trigger_ratio": defaults.fast_trigger_ratio,
             }
         )
-    highest_trigger = max(config.snip_threshold, config.collapse_threshold, config.auto_compact_threshold)
-    if config.blocked_threshold <= highest_trigger:
-        errors.append("compact.blocked_threshold must exceed all compact thresholds; using default thresholds")
-        config = CompactConfig(
-            **{
-                **config.__dict__,
-                "snip_threshold": defaults.snip_threshold,
-                "collapse_threshold": defaults.collapse_threshold,
-                "auto_compact_threshold": defaults.auto_compact_threshold,
-                "blocked_threshold": defaults.blocked_threshold,
-            }
-        )
+    if config.snip_target_ratio >= config.snip_trigger_ratio:
+        errors.append("compact.snip_target_ratio must be lower than snip_trigger_ratio; using defaults")
+        config = CompactConfig(**{**config.__dict__, "snip_target_ratio": defaults.snip_target_ratio, "snip_trigger_ratio": defaults.snip_trigger_ratio})
+    if config.collapse_target_ratio >= config.collapse_trigger_ratio:
+        errors.append("compact.collapse_target_ratio must be lower than collapse_trigger_ratio; using defaults")
+        config = CompactConfig(**{**config.__dict__, "collapse_target_ratio": defaults.collapse_target_ratio, "collapse_trigger_ratio": defaults.collapse_trigger_ratio})
     return config
 
 
@@ -519,19 +522,10 @@ def _parse_mcp_servers(data: dict[str, Any], errors: list[str]) -> dict[str, Mcp
 def _instruction_paths(home: Path, repo_root: Path, cwd: Path) -> list[Path]:
     """按优先级生成可能存在的项目说明文件路径列表。"""
     paths = [
-        home / "instructions.md",
         repo_root / "BIGCODE.md",
-        repo_root / ".bigcode" / "instructions.md",
+        repo_root / ".bigcode" / "BIGCODE.md",
+        home / "BIGCODE.md",
     ]
-    paths.extend(sorted((repo_root / ".bigcode" / "rules").glob("*.md")) if (repo_root / ".bigcode" / "rules").exists() else [])
-    paths.extend(
-        [
-            cwd / "BIGCODE.md",
-            cwd / ".bigcode" / "instructions.md",
-        ]
-    )
-    paths.extend(sorted((cwd / ".bigcode" / "rules").glob("*.md")) if (cwd / ".bigcode" / "rules").exists() else [])
-    paths.append(cwd / "BIGCODE.local.md")
     return _dedupe_paths(paths)
 
 
