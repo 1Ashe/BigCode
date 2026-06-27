@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from bigcode.commands import CommandRegistry, complete
+
 try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.completion import Completer, Completion
@@ -26,8 +28,9 @@ INVALID_APPROVAL_PROMPT = "Please type yes/y to allow, no/n or Enter to deny: "
 class SlashCommandCompleter(Completer):  # type: ignore[misc]
     """只在输入 / 命令时给出补全候选。"""
 
-    def __init__(self, commands: list[str]) -> None:
-        self.commands = commands
+    def __init__(self, *, command_registry: CommandRegistry | None = None, commands: list[str] | None = None) -> None:
+        self.command_registry = command_registry
+        self.commands = commands or []
 
     def get_completions(self, document: Any, complete_event: Any) -> Any:
         if Completion is None:
@@ -36,6 +39,10 @@ class SlashCommandCompleter(Completer):  # type: ignore[misc]
         if not text.startswith("/"):
             return
         prefix = text.split(maxsplit=1)[0]
+        if self.command_registry is not None:
+            for display, value in complete(self.command_registry, prefix):
+                yield Completion(value, start_position=-len(prefix), display=display)
+            return
         for command in self.commands:
             if command.startswith(prefix):
                 yield Completion(command, start_position=-len(prefix), display=command)
@@ -44,14 +51,21 @@ class SlashCommandCompleter(Completer):  # type: ignore[misc]
 class BigCodePromptUI:
     """prompt_toolkit 驱动的交互式输入和单行审批 UI。"""
 
-    def __init__(self, *, history_path: Path, slash_commands: list[str]) -> None:
+    def __init__(
+        self,
+        *,
+        history_path: Path,
+        command_registry: CommandRegistry | None = None,
+        slash_commands: list[str] | None = None,
+    ) -> None:
         if PromptSession is None or FileHistory is None or patch_stdout is None:
             raise RuntimeError("Interactive prompt UI requires prompt_toolkit. Install prompt_toolkit to use the BigCode REPL UI.")
         history_path.parent.mkdir(parents=True, exist_ok=True)
-        self.slash_commands = slash_commands
+        self.command_registry = command_registry
+        self.slash_commands = slash_commands or []
         self.session = PromptSession(
             history=FileHistory(str(history_path)),
-            completer=SlashCommandCompleter(slash_commands),
+            completer=SlashCommandCompleter(command_registry=command_registry, commands=self.slash_commands),
             complete_while_typing=True,
             reserve_space_for_menu=6,
         )

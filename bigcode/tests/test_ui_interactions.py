@@ -14,7 +14,7 @@ from bigcode.tools.permissions import ToolPermissionContext
 from bigcode.tools.plan.AskUserQuestion import AskUserQuestionInput, AskUserQuestionTool, UserQuestion
 from bigcode.tools.plan.ExitPlanMode import ExitPlanModeInput, ExitPlanModeTool
 from bigcode.tools.read_file_state import ReadFileState
-from bigcode.ui.repl import BigCodeRepl
+from bigcode.ui.repl import BigCodeRepl, _sane_terminal_settings
 from bigcode.ui.renderer import BigCodeStreamRenderer
 
 
@@ -57,6 +57,21 @@ class FakeText:
 
     def __str__(self) -> str:
         return self.message
+
+
+class FakePromptUI:
+    lines: list[object] = []
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self._lines = list(FakePromptUI.lines)
+
+    async def read_prompt(self) -> str:
+        if not self._lines:
+            raise EOFError
+        value = self._lines.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return str(value)
 
 
 class UIInteractionTests(unittest.TestCase):
@@ -178,6 +193,62 @@ class UIInteractionTests(unittest.TestCase):
         self.assertFalse(session.abort_event.is_set())
         self.assertTrue(statuses)
         self.assertTrue(statuses[0].stopped)
+
+    def test_tty_loop_restores_terminal_after_exit_command(self) -> None:
+        class FakeSession:
+            session_id = "sess"
+            model_ref = "model"
+
+            def __init__(self) -> None:
+                self.config = type("Config", (), {"project_state_dir": Path("/tmp")})()
+
+        restored: list[bool] = []
+        FakePromptUI.lines = ["/exit"]
+        repl = BigCodeRepl(FakeSession(), ui=FakeUI())  # type: ignore[arg-type]
+
+        with patch("bigcode.ui.repl.BigCodePromptUI", FakePromptUI), patch(
+            "bigcode.ui.repl._capture_terminal_restore", lambda **kwargs: lambda: restored.append(True)
+        ):
+            asyncio.run(repl._run_tty_loop())
+
+        self.assertEqual(restored, [True])
+
+    def test_tty_loop_restores_terminal_after_keyboard_interrupt(self) -> None:
+        class FakeSession:
+            session_id = "sess"
+            model_ref = "model"
+
+            def __init__(self) -> None:
+                self.config = type("Config", (), {"project_state_dir": Path("/tmp")})()
+
+        restored: list[bool] = []
+        FakePromptUI.lines = [KeyboardInterrupt()]
+        repl = BigCodeRepl(FakeSession(), ui=FakeUI())  # type: ignore[arg-type]
+
+        with patch("bigcode.ui.repl.BigCodePromptUI", FakePromptUI), patch(
+            "bigcode.ui.repl._capture_terminal_restore", lambda **kwargs: lambda: restored.append(True)
+        ):
+            asyncio.run(repl._run_tty_loop())
+
+        self.assertEqual(restored, [True])
+
+    def test_sane_terminal_settings_force_echo_and_canonical_mode(self) -> None:
+        class FakeTermios:
+            ECHO = 0b000001
+            ICANON = 0b000010
+            ISIG = 0b000100
+            IEXTEN = 0b001000
+            ICRNL = 0b010000
+            OPOST = 0b100000
+
+        settings = [0, 0, 0, 0, 0, 0, []]
+        sane = _sane_terminal_settings(FakeTermios, settings)
+
+        self.assertEqual(sane[0] & FakeTermios.ICRNL, FakeTermios.ICRNL)
+        self.assertEqual(sane[1] & FakeTermios.OPOST, FakeTermios.OPOST)
+        self.assertEqual(sane[3] & FakeTermios.ECHO, FakeTermios.ECHO)
+        self.assertEqual(sane[3] & FakeTermios.ICANON, FakeTermios.ICANON)
+        self.assertEqual(sane[3] & FakeTermios.ISIG, FakeTermios.ISIG)
 
 
 def _make_plan_context(root: Path, approval_callback) -> ToolExecutionContext:

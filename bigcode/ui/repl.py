@@ -7,17 +7,12 @@ import sys
 import threading
 from typing import Any
 
-from bigcode.context.compact import CompactDeps, apply_context_compact
-from bigcode.diagnostics import build_doctor_report, render_doctor_report
-from bigcode.tools.base import EmptyInput
-from bigcode.tools.plan.EnterPlanMode import EnterPlanModeTool
+from bigcode.commands import CommandContext, CommandRegistry, parse_command
+from bigcode.commands.handlers import register_all_commands
 
 from .console import BigCodeTUI
 from .prompt import BigCodePromptUI, read_yes_no_plain
 from .renderer import BigCodeStreamRenderer
-
-
-SLASH_COMMANDS = ["/help", "/exit", "/quit", "/status", "/doctor", "/plan", "/compact"]
 
 
 class BigCodeRepl:
@@ -26,12 +21,15 @@ class BigCodeRepl:
     def __init__(self, session: Any, *, ui: BigCodeTUI | None = None) -> None:
         self.session = session
         self.ui = ui or BigCodeTUI(enabled=True)
+        self.command_registry = CommandRegistry()
+        register_all_commands(self.command_registry)
         self.prompt_ui: BigCodePromptUI | None = None
         self._terminal_input_busy = threading.Event()
         self._renderer: BigCodeStreamRenderer | None = None
 
     async def run(self) -> None:
         """Run the interactive command loop."""
+        restore_terminal = _capture_terminal_restore(force_sane=True)
         await self.session.start()
         self.ui.header(self.session.session_id, self.session.model_ref)
         if self.session.config.config_errors:
@@ -53,6 +51,7 @@ class BigCodeRepl:
             shutdown = getattr(self.session, "shutdown", None)
             if shutdown is not None:
                 await shutdown()
+            restore_terminal()
 
     async def _run_piped_stdin(self) -> None:
         """Process each non-empty stdin line as a REPL input."""
@@ -73,32 +72,37 @@ class BigCodeRepl:
 
     async def _run_tty_loop(self) -> None:
         """Run prompt_toolkit-backed interactive input."""
+        restore_terminal = _capture_terminal_restore(force_sane=True)
         try:
-            self.prompt_ui = BigCodePromptUI(history_path=self._repl_history_path(), slash_commands=SLASH_COMMANDS)
+            self.prompt_ui = BigCodePromptUI(history_path=self._repl_history_path(), command_registry=self.command_registry)
         except RuntimeError as exc:
             self.ui.error(str(exc))
+            restore_terminal()
             return
-        while True:
-            try:
-                line = await self.prompt_ui.read_prompt()
-            except (EOFError, KeyboardInterrupt):
-                self.ui.print()
-                break
-            line = line.strip()
-            if not line:
-                continue
-            self.ui.print(f"You: {line}")
-            if line.startswith("/"):
-                should_exit = await self.handle_command(line)
-                if should_exit:
+        try:
+            while True:
+                try:
+                    line = await self.prompt_ui.read_prompt()
+                except (EOFError, KeyboardInterrupt):
+                    self.ui.print()
                     break
-                continue
-            try:
-                await self.run_turn(line, allow_escape_cancel=True)
-            except Exception as exc:
-                self.ui.error(format_exception(exc))
-                continue
-            self.ui.print()
+                line = line.strip()
+                if not line:
+                    continue
+                self.ui.print(f"You: {line}")
+                if line.startswith("/"):
+                    should_exit = await self.handle_command(line)
+                    if should_exit:
+                        break
+                    continue
+                try:
+                    await self.run_turn(line, allow_escape_cancel=True)
+                except Exception as exc:
+                    self.ui.error(format_exception(exc))
+                    continue
+                self.ui.print()
+        finally:
+            restore_terminal()
 
     def _repl_history_path(self) -> Any:
         return self.session.config.project_state_dir / "repl_history"
@@ -207,62 +211,25 @@ class BigCodeRepl:
 
     async def handle_command(self, line: str) -> bool:
         """Handle local slash commands."""
-        cmd, _, arg = line.partition(" ")
-        if cmd in {"/exit", "/quit"}:
-            return True
-        if cmd == "/help":
-            self.ui.print("Commands: " + ", ".join(SLASH_COMMANDS))
+        name, args, is_command = parse_command(line)
+        if not is_command:
             return False
-        if cmd == "/doctor":
-            parts = arg.split()
-            report = await build_doctor_report(
-                self.session.config,
-                model_ref=self.session.model_ref,
-                probe="--no-probe" not in parts,
-                timeout=parse_timeout(parts),
-                registry=self.session.registry,
-                skill_registry=self.session.skill_registry,
-                mcp_manager=self.session.mcp_manager,
-            )
-            self.ui.print(render_doctor_report(report), end="")
+        if not name:
+            await self.command_registry.find("help").handler(self._command_context(""))
             return False
-        if cmd == "/status":
-            self.ui.status_table(self._status_rows())
+        command = self.command_registry.find(name)
+        if command is None:
+            self.ui.print(f"Unknown command: /{name}")
             return False
-        if cmd == "/plan":
-            if not self.session.plan_state.active:
-                await EnterPlanModeTool().call(EmptyInput(), self.session.make_tool_context())
-                self.ui.print(f"Entered Plan Mode: {self.session.plan_state.plan_file}")
-            else:
-                content = self.session.plan_store.read(self.session.session_id) or ""
-                self.ui.print(f"Plan file: {self.session.plan_state.plan_file}")
-                self.ui.print(content or "(empty)")
-            return False
-        if cmd == "/compact":
-            compacted = await apply_context_compact(
-                self.session.messages,
-                CompactDeps(
-                    config=self.session.config.compact,
-                    state=self.session.compact_state,
-                    context_window=self.session.model.context_window or 128000,
-                    system_prompt=self.session.system_prompt,
-                    tool_schemas=self.session.registry.schemas_for_model(),
-                    is_main_thread=self.session.is_main_thread,
-                    summarize=self.session._summarize_context,
-                ),
-                force_auto=True,
-            )
-            self.session._append_compact_records(compacted.records_to_append)
-            self.session.read_file_state.clear()
-            self.session._save_snapshot()
-            self.ui.print(
-                "Compacted context: "
-                f"{compacted.tokens_before} -> {compacted.tokens_after} tokens "
-                f"({compacted.utilization_after:.1%})"
-            )
-            return False
-        self.ui.print(f"Unknown command: {cmd}")
-        return False
+        result = await command.handler(self._command_context(args))
+        return bool(result)
+
+    def _command_context(self, args: str) -> CommandContext:
+        return CommandContext(args=args, session=self.session, ui=self.ui, repl=self)
+
+    def status_rows(self) -> dict[str, Any]:
+        """Build rows for /status."""
+        return self._status_rows()
 
     def _status_rows(self) -> dict[str, Any]:
         rows: dict[str, Any] = {
@@ -298,18 +265,7 @@ def format_exception(exc: Exception) -> str:
     return str(exc).strip() or exc.__class__.__name__
 
 
-def parse_timeout(parts: list[str]) -> float:
-    """从 /doctor 参数列表里读取 --timeout，失败时回退到默认 10 秒。"""
-    if "--timeout" not in parts:
-        return 10.0
-    idx = parts.index("--timeout")
-    try:
-        return float(parts[idx + 1])
-    except (IndexError, ValueError):
-        return 10.0
-
-
-def _capture_terminal_restore() -> Any:
+def _capture_terminal_restore(*, force_sane: bool = False) -> Any:
     """Capture current terminal attrs and return an idempotent restore callback."""
     if sys.platform == "win32" or not sys.stdin.isatty():
         return lambda: None
@@ -329,8 +285,24 @@ def _capture_terminal_restore() -> Any:
             return
         restored = True
         try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, settings)
+            target = list(settings)
+            if force_sane:
+                target = _sane_terminal_settings(termios, target)
+            termios.tcsetattr(fd, termios.TCSADRAIN, target)
         except Exception:
             pass
 
     return restore
+
+
+def _sane_terminal_settings(termios: Any, settings: list[Any]) -> list[Any]:
+    """Force essential interactive terminal flags back on."""
+    sane = list(settings)
+    sane[3] |= termios.ECHO | termios.ICANON | termios.ISIG
+    if hasattr(termios, "IEXTEN"):
+        sane[3] |= termios.IEXTEN
+    if hasattr(termios, "ICRNL"):
+        sane[0] |= termios.ICRNL
+    if hasattr(termios, "OPOST"):
+        sane[1] |= termios.OPOST
+    return sane

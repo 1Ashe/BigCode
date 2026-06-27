@@ -117,12 +117,66 @@ def _is_html_content(content_type: str | None) -> bool:
 
 def _html_to_markdown(html: str) -> str:
     """Convert HTML to Markdown, with a small stdlib fallback for minimal installs."""
+    html = _strip_unsafe_html_content(html)
     if _markdownify is not None:
         return _markdownify(html, heading_style="ATX", strip=["script", "style"]).strip()
     parser = _PlainMarkdownParser()
     parser.feed(html)
     parser.close()
     return parser.markdown().strip()
+
+
+def _strip_unsafe_html_content(html: str) -> str:
+    """Remove script/style blocks before markdown conversion."""
+    parser = _UnsafeHtmlStripper()
+    parser.feed(html)
+    parser.close()
+    return parser.html()
+
+
+class _UnsafeHtmlStripper(HTMLParser):
+    """Drop unsafe HTML element contents while preserving other markup."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        self._parts.append(self.get_starttag_text() or f"<{tag}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if not self._skip_depth:
+            self._parts.append(self.get_starttag_text() or f"<{tag}/>")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if not self._skip_depth:
+            self._parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(f"&#{name};")
+
+    def html(self) -> str:
+        return "".join(self._parts)
 
 
 class _PlainMarkdownParser(HTMLParser):

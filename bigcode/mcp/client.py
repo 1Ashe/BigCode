@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from bigcode.config.models import McpServerConfig
@@ -34,10 +35,11 @@ class McpClientManager:
 
     它延迟创建 FastMCP Client，并缓存每个 server 的连接。
     """
-    def __init__(self, servers: dict[str, McpServerConfig], *, enabled: bool = True) -> None:
+    def __init__(self, servers: dict[str, McpServerConfig], *, enabled: bool = True, log_dir: Path | None = None) -> None:
         """保存 MCP server 配置，检测 fastmcp 是否可导入，并准备客户端缓存。"""
         self.servers = servers
         self.enabled = enabled
+        self.log_dir = log_dir
         self.capabilities: list[McpCapability] = []
         self._fastmcp_available = _fastmcp_available()
         self._clients: dict[str, Any] = {}
@@ -217,7 +219,7 @@ class McpClientManager:
             raise RuntimeError(f"MCP server {server_name!r} is not configured or disabled.")
         from fastmcp import Client  # type: ignore
 
-        config = _client_config(server)
+        config = _client_config(server, log_dir=self.log_dir)
         client = Client(config)
         enter = getattr(client, "__aenter__", None)
         if enter:
@@ -237,15 +239,35 @@ def _fastmcp_available() -> bool:
     return True
 
 
-def _client_config(server: McpServerConfig) -> Any:
+def _client_config(server: McpServerConfig, *, log_dir: Path | None = None) -> Any:
     """把 BigCode 的 MCP server 配置转换成 FastMCP Client 接受的格式。"""
     cfg = dict(server.config)
     transport = cfg.get("transport")
     if transport in {"http", "sse"} and cfg.get("url"):
         return cfg["url"]
     if transport == "stdio":
-        return {"mcpServers": {server.name: cfg}}
+        from fastmcp.client.transports import StdioTransport  # type: ignore
+
+        args = cfg.get("args") or []
+        env = cfg.get("env")
+        cwd = cfg.get("cwd")
+        keep_alive = cfg.get("keep_alive")
+        return StdioTransport(
+            command=str(cfg.get("command") or ""),
+            args=[str(arg) for arg in args] if isinstance(args, list) else [],
+            env=env if isinstance(env, dict) else None,
+            cwd=str(cwd) if cwd else None,
+            keep_alive=bool(keep_alive) if keep_alive is not None else None,
+            log_file=_stdio_log_file(server.name, log_dir),
+        )
     return cfg
+
+
+def _stdio_log_file(server_name: str, log_dir: Path | None) -> Path | None:
+    if log_dir is None:
+        return None
+    safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in server_name).strip("_")
+    return log_dir / f"{safe_name or 'server'}.log"
 
 
 async def _safe_list(client: Any, method: str) -> list[Any]:

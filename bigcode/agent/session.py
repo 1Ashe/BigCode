@@ -139,7 +139,11 @@ class AgentSession:
         self.agent_task_store = AgentTaskStore(config.project_state_dir)
         self._background_subagent_runs: dict[str, asyncio.Task[None]] = {}
         self.skill_registry = load_skills(config.skill_roots)
-        self.mcp_manager = McpClientManager(config.mcp_servers, enabled=config.mcp_enabled)
+        self.mcp_manager = McpClientManager(
+            config.mcp_servers,
+            enabled=config.mcp_enabled,
+            log_dir=config.project_state_dir / "mcp-logs",
+        )
         self.non_interactive = non_interactive
         self.approval_callback: Any | None = None
         self.terminal_interaction_callback: Any | None = None
@@ -148,6 +152,7 @@ class AgentSession:
         register_builtin_hooks(self.hook_bus)
         self.memory_manager = MemoryManager.for_config(config) if is_main_thread else None
         self._memory_tasks: set[asyncio.Task[None]] = set()
+        self._mcp_discovery_task: asyncio.Task[list[str]] | None = None
 
         # transcript 是完整消息流水账，snapshot 是可快速恢复的状态摘要。
         # 两者都保存，是为了兼顾“能恢复完整历史”和“能快速列出/恢复会话”。
@@ -244,6 +249,7 @@ class AgentSession:
         它发送 session_started 事件，触发 SessionStart hook，并保存一次快照。
         """
         await self.hook_bus.emit("SessionStart", HookInput("SessionStart", self.session_id, str(self.config.cwd), self.permission_context.mode))
+        self._start_mcp_discovery_background()
         self._save_snapshot()
 
     async def handle_command(self, line: str) -> bool:
@@ -254,6 +260,20 @@ class AgentSession:
 
     async def shutdown(self) -> None:
         """Release external resources and mark unfinished background work as cancelled."""
+        if self._mcp_discovery_task is not None:
+            task = self._mcp_discovery_task
+            self._mcp_discovery_task = None
+            if task.done():
+                try:
+                    task.result()
+                except Exception:
+                    pass
+            else:
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
         for task in list(self._memory_tasks):
             if task.done():
                 self._memory_tasks.discard(task)
@@ -326,7 +346,7 @@ class AgentSession:
             for step in range(max_steps):
                 self.compact_state.step_index = step
                 yield StatusEvent(session_id=self.session_id, status="model_request_started", metadata={"step": step})
-                await self._sync_mcp_tools_to_registry()
+                self._collect_mcp_discovery_background()
 
                 # 每一步请求模型前都重新构建上下文，因为上一轮工具结果、hook 附件、
                 # Plan Mode 状态等都可能刚刚变化。
@@ -870,6 +890,30 @@ class AgentSession:
         if ts_tool and hasattr(ts_tool, "set_mcp_sources"):
             ts_tool.set_mcp_sources(self.mcp_manager.server_summaries())
         return added
+
+    def _start_mcp_discovery_background(self) -> None:
+        """Start silent MCP discovery without delaying session startup."""
+        if not self.is_main_thread:
+            return
+        if not self.config.mcp_enabled or not self.mcp_manager.fastmcp_available:
+            return
+        if self._mcp_discovery_task is not None and not self._mcp_discovery_task.done():
+            return
+        try:
+            self._mcp_discovery_task = asyncio.create_task(self._sync_mcp_tools_to_registry())
+        except RuntimeError:
+            self._mcp_discovery_task = None
+
+    def _collect_mcp_discovery_background(self) -> None:
+        """Observe completed MCP discovery tasks so exceptions stay silent."""
+        task = self._mcp_discovery_task
+        if task is None or not task.done():
+            return
+        self._mcp_discovery_task = None
+        try:
+            task.result()
+        except Exception:
+            return
 
     def model_protocol_label(self) -> str:
         """返回当前模型协议；配置错误时返回占位文本。"""

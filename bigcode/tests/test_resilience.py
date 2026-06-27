@@ -12,7 +12,7 @@ from unittest.mock import patch
 from bigcode.agent.session import AgentSession
 from bigcode.config import load_runtime_config
 from bigcode.config.models import McpServerConfig
-from bigcode.mcp.client import McpClientManager
+from bigcode.mcp.client import McpClientManager, _client_config
 from bigcode.tools.bash.Bash import BashInput, BashTool
 from bigcode.tools.base import ToolExecutionContext
 from bigcode.tools.permissions import ToolPermissionContext
@@ -44,6 +44,56 @@ class ResilienceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "close timed out"):
             asyncio.run(manager.close_all())
         self.assertFalse(manager._clients)
+
+    def test_stdio_mcp_client_config_uses_log_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            server = McpServerConfig("bing/search", {"transport": "stdio", "command": "python", "args": ["server.py"]})
+            transport = _client_config(server, log_dir=Path(td))
+
+        self.assertEqual(getattr(transport, "command"), "python")
+        self.assertEqual(getattr(transport, "args"), ["server.py"])
+        self.assertEqual(getattr(transport, "log_file").name, "bing_search.log")
+
+    def test_session_start_schedules_mcp_discovery_without_awaiting(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            session = _make_session_for_mcp_start(Path(td))
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def discover() -> list[str]:
+                started.set()
+                await release.wait()
+                return ["mcp__server__tool"]
+
+            session._sync_mcp_tools_to_registry = discover  # type: ignore[method-assign]
+
+            async def run_start() -> None:
+                await session.start()
+                await asyncio.wait_for(started.wait(), timeout=1)
+                self.assertIsNotNone(session._mcp_discovery_task)
+                self.assertFalse(session._mcp_discovery_task.done())
+                release.set()
+                await asyncio.wait_for(session._mcp_discovery_task, timeout=1)
+
+            asyncio.run(run_start())
+
+    def test_session_collects_failed_mcp_discovery_silently(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            session = _make_session_for_mcp_start(Path(td))
+
+            async def discover() -> list[str]:
+                raise RuntimeError("boom")
+
+            session._sync_mcp_tools_to_registry = discover  # type: ignore[method-assign]
+
+            async def run_start() -> None:
+                await session.start()
+                assert session._mcp_discovery_task is not None
+                await asyncio.gather(session._mcp_discovery_task, return_exceptions=True)
+                session._collect_mcp_discovery_background()
+
+            asyncio.run(run_start())
+            self.assertIsNone(session._mcp_discovery_task)
 
     def test_bash_cancellation_kills_process(self) -> None:
         class FakeProcess:
@@ -165,3 +215,40 @@ def _make_tool_context(root: Path) -> ToolExecutionContext:
         session_id="sess",
         is_non_interactive_session=True,
     )
+
+
+def _make_session_for_mcp_start(root: Path) -> AgentSession:
+    home = root / "home"
+    repo = root / "repo"
+    repo.mkdir()
+    cfg = repo / ".bigcode"
+    cfg.mkdir()
+    (cfg / "models.json").write_text(
+        """
+        {
+          "default_model": "local:test",
+          "providers": {
+            "local": {
+              "protocol": "anthropic",
+              "base_url": "https://api.example.test/v1",
+              "models": {"test": {"id": "test-model", "context_window": 128000}}
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    (cfg / "mcp.json").write_text(
+        """
+        {
+          "mcpServers": {
+            "server": {"transport": "stdio", "command": "python", "args": ["server.py"]}
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    config = load_runtime_config(repo, env={"BIGCODE_HOME": str(home)})
+    session = AgentSession(config, session_id="sess_mcp_start", non_interactive=True)
+    session.mcp_manager._fastmcp_available = True
+    return session
