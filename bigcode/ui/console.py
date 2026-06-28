@@ -6,9 +6,13 @@ from typing import Any
 try:
     from rich.console import Console
     from rich.panel import Panel
+    from rich.rule import Rule
+    from rich.text import Text
 except ImportError:
     Console = None  # type: ignore[assignment]
     Panel = None  # type: ignore[assignment]
+    Rule = None  # type: ignore[assignment]
+    Text = None  # type: ignore[assignment]
 
 
 class BigCodeTUI:
@@ -35,6 +39,25 @@ class BigCodeTUI:
             self.console.print(text, end="", markup=False, highlight=False)
         else:
             print(text, end="", flush=True)
+
+    def stream_marker(self, *, marker_style: str) -> None:
+        """输出模型文本行首圆点。"""
+        if not self.enabled:
+            return
+        if self.console is not None and Text is not None:
+            renderable = Text("● ", style=marker_style)
+            self.console.print(renderable, end="", highlight=False)
+        else:
+            print("● ", end="", flush=True)
+
+    def divider(self) -> None:
+        """输出 turn 之间的分隔线。"""
+        if not self.enabled:
+            return
+        if self.console is not None and Rule is not None:
+            self.console.print(Rule(style="dim"))
+        else:
+            print("-" * 72)
 
     def header(self, session_id: str, model: str | None) -> None:
         """输出会话头部。"""

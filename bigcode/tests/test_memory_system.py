@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from bigcode.agent.snapshot import SessionSnapshot, cleanup_old_sessions, save_session_snapshot
+from bigcode.agent.snapshot import SessionSnapshot, cleanup_old_sessions, next_session_id, save_session_snapshot
 from bigcode.context.messages import AssistantMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
 from bigcode.context.system_prompt import build_system_prompt
 from bigcode.context.transcript import Transcript
@@ -166,6 +166,18 @@ class MemorySystemTests(unittest.TestCase):
             self.assertFalse(old_transcript.exists())
             self.assertTrue(new_path.exists())
             self.assertTrue(new_transcript.exists())
+
+    def test_next_session_id_is_monotonic_across_existing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"
+            (state / "transcripts").mkdir(parents=True)
+            (state / "transcripts" / "session_000007.jsonl").write_text("{}\n", encoding="utf-8")
+
+            self.assertEqual(next_session_id(state), "session_000008")
+            self.assertEqual(next_session_id(state), "session_000009")
+
+            counter = (state / "session_counter").read_text(encoding="utf-8")
+            self.assertEqual(counter, "9")
 
 
 if __name__ == "__main__":

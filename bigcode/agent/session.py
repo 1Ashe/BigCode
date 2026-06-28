@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 from bigcode.agent.events import AgentEvent, ErrorEvent, StatusEvent, StreamEvent, ToolCompleted, TurnCompleted
-from bigcode.agent.snapshot import SessionSnapshot, cleanup_old_sessions, load_session_snapshot, save_session_snapshot
+from bigcode.agent.snapshot import SessionSnapshot, cleanup_old_sessions, load_session_snapshot, next_session_id, save_session_snapshot
 from bigcode.config.models import ResolvedModel, RuntimeConfig
 from bigcode.context.budget import ToolBudgetState, apply_tool_result_budget
 from bigcode.context.builder import ContextBuildDeps, build_context_for_api
@@ -96,7 +96,7 @@ class AgentSession:
         if persist_snapshot and is_main_thread:
             cleanup_old_sessions(config.project_state_dir)
         snapshot = load_session_snapshot(config.project_state_dir, session_id) if session_id and persist_snapshot else None
-        self.session_id = session_id or new_id("session")
+        self.session_id = session_id or next_session_id(config.project_state_dir)
         self.task_list_id = (snapshot.task_list_id if snapshot else None) or config.task_default_list_id or self.session_id
         self.model_ref = model_ref or (snapshot.model if snapshot else None) or config.default_model_ref
 
@@ -396,7 +396,7 @@ class AgentSession:
                     # continuation 文本是 projected 中的唯一一条消息。
                     self._save_snapshot()
                     old_session_id = self.session_id
-                    self.session_id = new_id("session")
+                    self.session_id = next_session_id(self.config.project_state_dir)
                     self.transcript = Transcript(
                         self.config.project_state_dir / "transcripts" / f"{self.session_id}.jsonl"
                     )

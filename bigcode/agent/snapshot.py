@@ -14,6 +14,7 @@ from bigcode.utils.jsonio import read_json_file, read_jsonl, to_jsonable, write_
 
 SNAPSHOT_VERSION = 2
 DEFAULT_MAX_SESSION_AGE_DAYS = 30
+SESSION_COUNTER_FILE = "session_counter"
 
 
 @dataclass
@@ -60,6 +61,20 @@ class SessionListItem:
 def session_snapshot_path(project_state_dir: Path, session_id: str) -> Path:
     """根据项目状态目录和 session_id 计算快照文件路径。"""
     return project_state_dir / "sessions" / f"{session_id}.json"
+
+
+def next_session_id(project_state_dir: Path) -> str:
+    """Allocate a monotonically increasing human-readable session id."""
+    counter_path = project_state_dir / SESSION_COUNTER_FILE
+    current = _read_counter(counter_path)
+    highest = max(current, _highest_session_number(project_state_dir))
+    next_number = highest + 1
+    try:
+        counter_path.parent.mkdir(parents=True, exist_ok=True)
+        counter_path.write_text(str(next_number), encoding="utf-8")
+    except OSError:
+        pass
+    return f"session_{next_number:06d}"
 
 
 def save_session_snapshot(project_state_dir: Path, snapshot: SessionSnapshot) -> Path:
@@ -159,6 +174,34 @@ def _remove_tree(path: Path) -> None:
         path.rmdir()
     except OSError:
         pass
+
+
+def _read_counter(path: Path) -> int:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _highest_session_number(project_state_dir: Path) -> int:
+    highest = 0
+    for directory, suffix in (
+        (project_state_dir / "sessions", ".json"),
+        (project_state_dir / "transcripts", ".jsonl"),
+    ):
+        if not directory.exists():
+            continue
+        for path in directory.glob(f"session_*{suffix}"):
+            number = _session_number(path.name[: -len(suffix)])
+            highest = max(highest, number)
+    return highest
+
+
+def _session_number(session_id: str) -> int:
+    if not session_id.startswith("session_"):
+        return 0
+    tail = session_id.removeprefix("session_")
+    return int(tail) if tail.isdigit() else 0
 
 
 def _snapshot_from_dict(data: dict[str, Any]) -> SessionSnapshot | None:

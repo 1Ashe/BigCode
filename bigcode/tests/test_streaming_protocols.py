@@ -38,6 +38,45 @@ class SessionStreamingTests(unittest.TestCase):
         config = load_runtime_config(root, env={"BIGCODE_HOME": str(home)})
         return AgentSession(config, session_id=session_id, non_interactive=True)
 
+    def make_config(self, temp_dir: str):
+        root = Path(temp_dir) / "repo"
+        home = Path(temp_dir) / "home"
+        root.mkdir()
+        cfg = root / ".bigcode"
+        cfg.mkdir()
+        (cfg / "models.json").write_text(
+            """
+            {
+              "default_model": "local:test",
+              "providers": {
+                "local": {
+                  "protocol": "anthropic",
+                  "base_url": "https://api.example.test/v1",
+                  "models": {"test": {"id": "test-model", "context_window": 128000}}
+                }
+              }
+            }
+            """,
+            encoding="utf-8",
+        )
+        return load_runtime_config(root, env={"BIGCODE_HOME": str(home)})
+
+    def test_new_sessions_use_incrementing_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = self.make_config(td)
+            first = AgentSession(config, non_interactive=True)
+            second = AgentSession(config, non_interactive=True)
+
+        self.assertEqual(first.session_id, "session_000001")
+        self.assertEqual(second.session_id, "session_000002")
+
+    def test_explicit_session_id_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config = self.make_config(td)
+            session = AgentSession(config, session_id="sess_stream", non_interactive=True)
+
+        self.assertEqual(session.session_id, "sess_stream")
+
     def test_text_deltas_are_emitted_before_turn_completion(self) -> None:
         class FakeStreamClient:
             async def stream(self, system_prompt: str, messages: list[Any], tools: list[dict[str, Any]]):

@@ -22,6 +22,7 @@ class BigCodeStreamRenderer:
         self._stream_open = False
         self._status: Any | None = None
         self._answer_started = False
+        self._current_stream_has_text = False
         self.assistant_text = ""
 
     def handle(self, event: Any) -> None:
@@ -31,15 +32,22 @@ class BigCodeStreamRenderer:
             if not self._answer_started:
                 erase_previous_prompt_line(lines=1)
             self._clear_status()
+            if not self._stream_open:
+                self.ui.stream_marker(marker_style="dim")
+                self._stream_open = True
+                self._current_stream_has_text = False
             self.ui.stream_text(event.text)
             self.assistant_text += event.text
-            self._stream_open = True
+            self._current_stream_has_text = True
             self._answer_started = True
             return
-        self._close_stream()
         if event_type == "status":
+            if getattr(event, "status", "") == "model_tool_call_started":
+                self._close_stream()
             self._handle_status(event)
             return
+        if event_type in {"tool_started", "tool_progress", "tool_completed", "permission_requested", "permission_resolved", "error"}:
+            self._close_stream()
         if event_type == "permission_requested":
             self._clear_status()
             return
@@ -62,12 +70,24 @@ class BigCodeStreamRenderer:
             self._set_status(f"Error: {event.message}")
             return
         if event_type == "turn_completed":
+            self._clear_status()
+            self._render_turn_divider()
             self.close()
+
+    def _render_turn_divider(self) -> None:
+        if self._stream_open:
+            self.ui.print()
+            self._reset_stream_state()
+        self.ui.divider()
 
     def _close_stream(self) -> None:
         if self._stream_open:
             self.ui.print()
-            self._stream_open = False
+            self._reset_stream_state()
+
+    def _reset_stream_state(self) -> None:
+        self._stream_open = False
+        self._current_stream_has_text = False
 
     def close(self) -> None:
         """关闭 Rich 状态/流式文本状态。"""

@@ -31,6 +31,12 @@ class FakeUI:
     def stream_text(self, text: str) -> None:
         self.calls.append(("stream", text, None))
 
+    def stream_marker(self, *, marker_style: str) -> None:
+        self.calls.append(("marker", None, marker_style))
+
+    def divider(self) -> None:
+        self.calls.append(("divider", None, None))
+
 
 class FakeStatus:
     instances: list["FakeStatus"] = []
@@ -82,15 +88,18 @@ class UIInteractionTests(unittest.TestCase):
 
         with patch("bigcode.ui.renderer.Status", FakeStatus), patch("bigcode.ui.renderer.Text", FakeText):
             renderer.handle(StreamEvent("sess", "checking"))
+            renderer.handle(StatusEvent("sess", "model_tool_call_started", metadata={"tool_name": "WebSearch"}))
             renderer.handle(ToolStarted("sess", "toolu_1", "WebSearch"))
             renderer.handle(ToolCompleted("sess", "toolu_1", "WebSearch", False, 1))
             renderer.handle(StreamEvent("sess", " done"))
-            renderer.handle(TurnCompleted("sess", "checking done", "end_turn", 1))
+            renderer.handle(TurnCompleted("sess", "done", "end_turn", 1))
 
+        self.assertEqual([call for call in ui.calls if call[0] == "marker"], [("marker", None, "dim"), ("marker", None, "dim")])
         self.assertEqual([call for call in ui.calls if call[0] == "stream"], [("stream", "checking", None), ("stream", " done", None)])
         self.assertEqual([call for call in ui.calls if call[0] == "print"], [("print", (), "\n"), ("print", (), "\n")])
+        self.assertEqual([call for call in ui.calls if call[0] == "divider"], [("divider", None, None)])
         self.assertEqual(renderer.assistant_text, "checking done")
-        self.assertEqual([status.messages for status in FakeStatus.instances], [["Running WebSearch...", "Completed WebSearch"]])
+        self.assertEqual([status.messages for status in FakeStatus.instances], [["Thinking... calling WebSearch", "Running WebSearch...", "Completed WebSearch"]])
         self.assertTrue(FakeStatus.instances[0].stopped)
 
     def test_renderer_handles_permission_events_after_streamed_text(self) -> None:
@@ -102,12 +111,27 @@ class UIInteractionTests(unittest.TestCase):
             renderer.handle(StreamEvent("sess", "checking"))
             renderer.handle(PermissionRequested("sess", "toolu_1", "WebSearch", "Approve WebSearch?"))
             renderer.handle(PermissionResolved("sess", "toolu_1", "WebSearch", True, "user"))
-            renderer.handle(TurnCompleted("sess", "checking", "end_turn", 0))
+            renderer.handle(TurnCompleted("sess", "approved", "end_turn", 0))
 
         self.assertEqual(renderer.assistant_text, "checking")
-        self.assertIn(("print", (), "\n"), ui.calls)
+        self.assertEqual([call for call in ui.calls if call[0] == "marker"], [("marker", None, "dim")])
+        self.assertEqual([call for call in ui.calls if call[0] == "stream"], [("stream", "checking", None)])
+        self.assertIn(("divider", None, None), ui.calls)
         self.assertEqual([status.messages for status in FakeStatus.instances], [["Permission approved: WebSearch"]])
         self.assertTrue(FakeStatus.instances[0].stopped)
+
+    def test_renderer_marks_direct_final_answer_without_intermediate_echo(self) -> None:
+        ui = FakeUI()
+        renderer = BigCodeStreamRenderer(ui)  # type: ignore[arg-type]
+
+        renderer.handle(StreamEvent("sess", "final"))
+        renderer.handle(StreamEvent("sess", " answer"))
+        renderer.handle(TurnCompleted("sess", "final answer", "end_turn", 0))
+
+        self.assertEqual([call for call in ui.calls if call[0] == "marker"], [("marker", None, "dim")])
+        self.assertEqual([call for call in ui.calls if call[0] == "stream"], [("stream", "final", None), ("stream", " answer", None)])
+        self.assertEqual([call for call in ui.calls if call[0] == "divider"], [("divider", None, None)])
+        self.assertEqual(renderer.assistant_text, "final answer")
 
     def test_exit_plan_mode_uses_approval_callback(self) -> None:
         calls: list[str] = []
